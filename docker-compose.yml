@@ -1,0 +1,73 @@
+services:
+  # ==========================================
+  # MongoDB Database Service
+  # ==========================================
+  mongodb:
+    image: mongo:7.0
+    container_name: iptv_mongodb
+    restart: unless-stopped
+    ports:
+      - "${MONGODB_PORT:-27017}:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - iptv_network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ==========================================
+  # IPTV API Backend Service (Node.js/Express)
+  # ==========================================
+  api:
+    build:
+      context: ./IPTV_API
+      dockerfile: Dockerfile
+    container_name: iptv_api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8080}:8080"
+    environment:
+      - PORT=8080
+      - MONGODB_URI=mongodb://mongodb:27017/iptv
+      - DATA_DIR=/app/data
+    volumes:
+      - iptv_media_data:/app/data
+      # To store media on your local machine instead of a Docker volume, uncomment below:
+      # - ./data:/app/data
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - iptv_network
+
+  # ==========================================
+  # React Admin Dashboard (Nginx + React SPA)
+  # ==========================================
+  dashboard:
+    build:
+      context: ./IPTV_Admin_Dashboard
+      dockerfile: Dockerfile
+      args:
+        - REACT_APP_API_URL=${REACT_APP_API_URL:-}
+    container_name: iptv_dashboard
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      - api
+    networks:
+      - iptv_network
+
+networks:
+  iptv_network:
+    driver: bridge
+
+volumes:
+  mongo_data:
+    driver: local
+  iptv_media_data:
+    driver: local
