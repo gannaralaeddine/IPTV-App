@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { SeriesAPI, SeasonAPI } from '../services/api';
 import AdminLayout from './layout/AdminLayout';
+import EpisodesModal from './EpisodesModal';
+import SearchBar from './SearchBar';
 
 const Seasons = () => {
     const [seasons, setSeasons] = useState([]);
@@ -13,8 +15,10 @@ const Seasons = () => {
         cover: ''
     });
     const [editingId, setEditingId] = useState(null);
+    const [searchTerm, setSearchTerm] = useState('');
     const [error, setError] = useState('');
     const [success, setSuccess] = useState('');
+    const [selectedSeasonForEpisodes, setSelectedSeasonForEpisodes] = useState(null);
 
     useEffect(() => {
         fetchSeasons();
@@ -101,6 +105,15 @@ const Seasons = () => {
         const seriesItem = series.find(s => s.series_id === seriesId);
         return seriesItem ? seriesItem.name : `Series ${seriesId}`;
     };
+
+    const filteredSeasons = seasons.filter((season) => {
+        if (!searchTerm.trim()) return true;
+        const term = searchTerm.toLowerCase();
+        const sNum = String(season.season_number || '');
+        const name = (season.name || '').toLowerCase();
+        const seriesName = getSeriesName(season.series_id).toLowerCase();
+        return sNum.includes(term) || name.includes(term) || seriesName.includes(term);
+    });
 
     return (
         <AdminLayout
@@ -205,11 +218,16 @@ const Seasons = () => {
             </div>
 
             <div className="admin-card">
-                <div className="admin-card-header bg-light">
-                    <h3 className="admin-card-title">
+                <div className="admin-card-header bg-light d-flex flex-wrap justify-content-between align-items-center gap-2">
+                    <h3 className="admin-card-title mb-0">
                         <i className="fa-solid fa-layer-group text-primary me-2"></i>
-                        Available Seasons ({seasons.length})
+                        Available Seasons ({filteredSeasons.length}{searchTerm.trim() ? ` of ${seasons.length}` : ''})
                     </h3>
+                    <SearchBar
+                        value={searchTerm}
+                        onChange={setSearchTerm}
+                        placeholder="Search seasons..."
+                    />
                 </div>
                 <div className="admin-card-body p-0">
                     <div className="table-responsive">
@@ -221,12 +239,12 @@ const Seasons = () => {
                                     <th>Season</th>
                                     <th>Name</th>
                                     <th>Cover</th>
-                                    <th style={{ width: '150px' }} className="text-center">Actions</th>
+                                    <th style={{ width: '220px' }} className="text-center">Actions</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                {seasons.length > 0 ? (
-                                    seasons.map((season) => (
+                                {filteredSeasons.length > 0 ? (
+                                    filteredSeasons.map((season) => (
                                         <tr key={season._id}>
                                             <td className="fw-bold text-muted">#{season.season_id}</td>
                                             <td className="fw-semibold">{getSeriesName(season.series_id)}</td>
@@ -245,6 +263,14 @@ const Seasons = () => {
                                                 ) : '-'}
                                             </td>
                                             <td className="text-center">
+                                                <button
+                                                    onClick={() => setSelectedSeasonForEpisodes(season)}
+                                                    className="btn btn-sm btn-outline-success me-2"
+                                                    title="Manage Episodes"
+                                                >
+                                                    <i className="fa-solid fa-clapperboard me-1"></i>
+                                                    Episodes
+                                                </button>
                                                 <button
                                                     onClick={() => handleEdit(season)}
                                                     className="btn btn-sm btn-outline-primary me-2"
@@ -265,7 +291,21 @@ const Seasons = () => {
                                 ) : (
                                     <tr>
                                         <td colSpan="6" className="text-center py-4 text-muted">
-                                            No seasons found. Use the form above to add a season.
+                                            {searchTerm.trim() ? (
+                                                <>
+                                                    <i className="fa-solid fa-magnifying-glass me-2"></i>
+                                                    No seasons found matching "{searchTerm}".{' '}
+                                                    <button
+                                                        type="button"
+                                                        className="btn btn-link btn-sm p-0 ms-1"
+                                                        onClick={() => setSearchTerm('')}
+                                                    >
+                                                        Clear search
+                                                    </button>
+                                                </>
+                                            ) : (
+                                                <>No seasons found. Use the form above to add a season.</>
+                                            )}
                                         </td>
                                     </tr>
                                 )}
@@ -274,6 +314,16 @@ const Seasons = () => {
                     </div>
                 </div>
             </div>
+
+            {/* Episodes Modal Popup for selected season */}
+            {selectedSeasonForEpisodes && (
+                <EpisodesModal
+                    isOpen={true}
+                    series={series.find(s => s.series_id === selectedSeasonForEpisodes.series_id)}
+                    season={selectedSeasonForEpisodes}
+                    onClose={() => setSelectedSeasonForEpisodes(null)}
+                />
+            )}
         </AdminLayout>
     );
 };

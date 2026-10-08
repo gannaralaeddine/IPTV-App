@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { SeriesAPI } from '../services/api';
 import AdminLayout from './layout/AdminLayout';
+import SeasonsModal from './SeasonsModal';
+import SearchBar from './SearchBar';
 
 const SeriesStreams = () => {
     const [streams, setStreams] = useState([]);
@@ -12,8 +14,11 @@ const SeriesStreams = () => {
         added: ''
     });
     const [editingId, setEditingId] = useState(null);
+    const [showModal, setShowModal] = useState(false);
+    const [searchTerm, setSearchTerm] = useState('');
     const [error, setError] = useState('');
     const [success, setSuccess] = useState('');
+    const [selectedSeriesForSeasons, setSelectedSeriesForSeasons] = useState(null);
 
     useEffect(() => {
         fetchStreams();
@@ -44,6 +49,11 @@ const SeriesStreams = () => {
         return cat ? cat.category_name : `Category ${categoryId}`;
     };
 
+    const handleOpenCreateModal = () => {
+        resetForm();
+        setShowModal(true);
+    };
+
     const handleSubmit = async (e) => {
         e.preventDefault();
         try {
@@ -62,6 +72,7 @@ const SeriesStreams = () => {
                 setSuccess('Series created successfully');
             }
             await fetchStreams();
+            setShowModal(false);
             resetForm();
             setTimeout(() => setSuccess(''), 3000);
         } catch (err) {
@@ -78,7 +89,7 @@ const SeriesStreams = () => {
         });
         setEditingId(stream._id);
         setError('');
-        window.scrollTo({ top: 0, behavior: 'smooth' });
+        setShowModal(true);
     };
 
     const handleDelete = async (id) => {
@@ -105,6 +116,15 @@ const SeriesStreams = () => {
         setError('');
     };
 
+    const filteredStreams = streams.filter((stream) => {
+        if (!searchTerm.trim()) return true;
+        const term = searchTerm.toLowerCase();
+        const name = (stream.name || '').toLowerCase();
+        const id = String(stream.series_id || '');
+        const catName = getCategoryName(stream.category_id).toLowerCase();
+        return name.includes(term) || id.includes(term) || catName.includes(term);
+    });
+
     return (
         <AdminLayout
             title="TV Series"
@@ -117,78 +137,23 @@ const SeriesStreams = () => {
             {error && <div className="alert alert-danger">{error}</div>}
             {success && <div className="alert alert-success">{success}</div>}
 
-            <div className="admin-card mb-4">
-                <div className="admin-card-header bg-light">
-                    <h3 className="admin-card-title">
-                        <i className={`fa-solid ${editingId ? 'fa-pen-to-square' : 'fa-plus'} text-primary me-2`}></i>
-                        {editingId ? 'Edit Series' : 'Add New TV Series'}
-                    </h3>
-                </div>
-                <div className="admin-card-body">
-                    <form onSubmit={handleSubmit}>
-                        <div className="row g-3">
-                            <div className="col-md-6">
-                                <label className="form-label fw-semibold">Series Title *</label>
-                                <input
-                                    type="text"
-                                    placeholder="e.g. Breaking Bad, Game of Thrones"
-                                    value={formData.name}
-                                    onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                                    className="form-control"
-                                    required
-                                />
-                            </div>
-
-                            <div className="col-md-6">
-                                <label className="form-label fw-semibold">Category *</label>
-                                <select
-                                    value={formData.category_id}
-                                    onChange={(e) => setFormData({ ...formData, category_id: e.target.value })}
-                                    className="form-select"
-                                    required
-                                >
-                                    <option value="">-- Select Series Category --</option>
-                                    {categories.map((cat) => (
-                                        <option key={cat._id} value={cat.category_id}>
-                                            {cat.category_name}
-                                        </option>
-                                    ))}
-                                </select>
-                            </div>
-
-                            <div className="col-md-12">
-                                <label className="form-label fw-semibold">Series Cover / Poster URL</label>
-                                <input
-                                    type="text"
-                                    placeholder="https://example.com/poster.jpg"
-                                    value={formData.stream_icon}
-                                    onChange={(e) => setFormData({ ...formData, stream_icon: e.target.value })}
-                                    className="form-control"
-                                />
-                            </div>
-                        </div>
-
-                        <div className="mt-4 d-flex gap-2">
-                            <button type="submit" className="btn btn-primary px-4">
-                                <i className="fa-solid fa-check me-1"></i>
-                                {editingId ? 'Update Series' : 'Save Series'}
-                            </button>
-                            {editingId && (
-                                <button type="button" onClick={resetForm} className="btn btn-secondary px-3">
-                                    Cancel
-                                </button>
-                            )}
-                        </div>
-                    </form>
-                </div>
-            </div>
-
+            {/* Series Table Card (Displayed First) */}
             <div className="admin-card">
-                <div className="admin-card-header bg-light">
-                    <h3 className="admin-card-title">
+                <div className="admin-card-header bg-light d-flex flex-wrap justify-content-between align-items-center gap-2">
+                    <h3 className="admin-card-title mb-0">
                         <i className="fa-solid fa-tv text-primary me-2"></i>
-                        Available Series ({streams.length})
+                        Available Series ({filteredStreams.length}{searchTerm.trim() ? ` of ${streams.length}` : ''})
                     </h3>
+                    <div className="d-flex align-items-center gap-2">
+                        <SearchBar
+                            value={searchTerm}
+                            onChange={setSearchTerm}
+                            placeholder="Search TV series..."
+                        />
+                        <button onClick={handleOpenCreateModal} className="btn btn-sm btn-primary text-nowrap">
+                            <i className="fa-solid fa-plus me-1"></i> Add TV Series
+                        </button>
+                    </div>
                 </div>
                 <div className="admin-card-body p-0">
                     <div className="table-responsive">
@@ -200,12 +165,12 @@ const SeriesStreams = () => {
                                     <th>Title</th>
                                     <th>Category</th>
                                     <th>Added Date</th>
-                                    <th style={{ width: '150px' }} className="text-center">Actions</th>
+                                    <th style={{ width: '220px' }} className="text-center">Actions</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                {streams.length > 0 ? (
-                                    streams.map((stream) => (
+                                {filteredStreams.length > 0 ? (
+                                    filteredStreams.map((stream) => (
                                         <tr key={stream._id}>
                                             <td className="fw-bold text-muted">#{stream.series_id}</td>
                                             <td>
@@ -231,6 +196,14 @@ const SeriesStreams = () => {
                                             </td>
                                             <td className="text-center">
                                                 <button
+                                                    onClick={() => setSelectedSeriesForSeasons(stream)}
+                                                    className="btn btn-sm btn-outline-info me-2"
+                                                    title="Manage Seasons"
+                                                >
+                                                    <i className="fa-solid fa-layer-group me-1"></i>
+                                                    Seasons
+                                                </button>
+                                                <button
                                                     onClick={() => handleEdit(stream)}
                                                     className="btn btn-sm btn-outline-primary me-2"
                                                     title="Edit"
@@ -250,7 +223,21 @@ const SeriesStreams = () => {
                                 ) : (
                                     <tr>
                                         <td colSpan="6" className="text-center py-4 text-muted">
-                                            No TV series found. Use the form above to add one.
+                                            {searchTerm.trim() ? (
+                                                <>
+                                                    <i className="fa-solid fa-magnifying-glass me-2"></i>
+                                                    No TV series found matching "{searchTerm}".{' '}
+                                                    <button
+                                                        type="button"
+                                                        className="btn btn-link btn-sm p-0 ms-1"
+                                                        onClick={() => setSearchTerm('')}
+                                                    >
+                                                        Clear search
+                                                    </button>
+                                                </>
+                                            ) : (
+                                                <>No TV series found. Click <strong>Add TV Series</strong> above to add one.</>
+                                            )}
                                         </td>
                                     </tr>
                                 )}
@@ -259,6 +246,100 @@ const SeriesStreams = () => {
                     </div>
                 </div>
             </div>
+
+            {/* Popup Modal for Add / Edit Series */}
+            {showModal && (
+                <div
+                    className="modal fade show d-block"
+                    tabIndex="-1"
+                    style={{ backgroundColor: 'rgba(0, 0, 0, 0.55)', zIndex: 1050 }}
+                >
+                    <div className="modal-dialog modal-dialog-centered">
+                        <div className="modal-content shadow-lg border-0">
+                            <div className="modal-header bg-primary text-white py-3">
+                                <h5 className="modal-title mb-0">
+                                    <i className={`fa-solid ${editingId ? 'fa-pen-to-square' : 'fa-plus'} me-2`}></i>
+                                    {editingId ? 'Edit TV Series' : 'Add New TV Series'}
+                                </h5>
+                                <button
+                                    type="button"
+                                    className="btn-close btn-close-white"
+                                    onClick={() => setShowModal(false)}
+                                    aria-label="Close"
+                                ></button>
+                            </div>
+                            <form onSubmit={handleSubmit}>
+                                <div className="modal-body p-4">
+                                    <div className="row g-3">
+                                        <div className="col-md-6">
+                                            <label className="form-label fw-semibold">Series Title *</label>
+                                            <input
+                                                type="text"
+                                                placeholder="e.g. Breaking Bad, Game of Thrones"
+                                                value={formData.name}
+                                                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                                                className="form-control"
+                                                required
+                                                autoFocus
+                                            />
+                                        </div>
+
+                                        <div className="col-md-6">
+                                            <label className="form-label fw-semibold">Category *</label>
+                                            <select
+                                                value={formData.category_id}
+                                                onChange={(e) => setFormData({ ...formData, category_id: e.target.value })}
+                                                className="form-select"
+                                                required
+                                            >
+                                                <option value="">-- Select Series Category --</option>
+                                                {categories.map((cat) => (
+                                                    <option key={cat._id} value={cat.category_id}>
+                                                        {cat.category_name}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        </div>
+
+                                        <div className="col-md-12">
+                                            <label className="form-label fw-semibold">Series Cover / Poster URL</label>
+                                            <input
+                                                type="text"
+                                                placeholder="https://example.com/poster.jpg"
+                                                value={formData.stream_icon}
+                                                onChange={(e) => setFormData({ ...formData, stream_icon: e.target.value })}
+                                                className="form-control"
+                                            />
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="modal-footer bg-light py-2">
+                                    <button
+                                        type="button"
+                                        className="btn btn-secondary btn-sm"
+                                        onClick={() => setShowModal(false)}
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button type="submit" className="btn btn-primary btn-sm px-3">
+                                        <i className="fa-solid fa-check me-1"></i>
+                                        {editingId ? 'Update Series' : 'Save Series'}
+                                    </button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Seasons Modal Popup for selected series */}
+            {selectedSeriesForSeasons && (
+                <SeasonsModal
+                    isOpen={true}
+                    series={selectedSeriesForSeasons}
+                    onClose={() => setSelectedSeriesForSeasons(null)}
+                />
+            )}
         </AdminLayout>
     );
 };

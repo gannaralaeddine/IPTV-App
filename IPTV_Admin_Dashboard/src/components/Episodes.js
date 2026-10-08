@@ -1,6 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { SeriesAPI, SeasonAPI, EpisodeAPI } from '../services/api';
 import AdminLayout from './layout/AdminLayout';
+import UploadProgressBar, { formatBytes, createUploadProgressHandler } from './UploadProgressBar';
+import SearchBar from './SearchBar';
 
 const Episodes = () => {
     const [episodes, setEpisodes] = useState([]);
@@ -19,6 +21,11 @@ const Episodes = () => {
     const [editingId, setEditingId] = useState(null);
     const [error, setError] = useState('');
     const [success, setSuccess] = useState('');
+    const [uploadProgress, setUploadProgress] = useState(0);
+    const [isUploading, setIsUploading] = useState(false);
+    const [uploadStats, setUploadStats] = useState({ loaded: 0, total: 0, speed: 0, estimatedTime: null });
+    const [searchTerm, setSearchTerm] = useState('');
+    const fileInputRef = useRef(null);
 
     useEffect(() => {
         fetchEpisodes();
@@ -72,11 +79,21 @@ const Episodes = () => {
                 throw new Error('File is required for new episodes');
             }
 
+            if (formData.file) {
+                setIsUploading(true);
+                setUploadProgress(0);
+                setUploadStats({ loaded: 0, total: formData.file.size, speed: 0, estimatedTime: null });
+            }
+
+            const axiosConfig = formData.file ? {
+                onUploadProgress: createUploadProgressHandler(setUploadProgress, setUploadStats)
+            } : {};
+
             if (editingId) {
-                await EpisodeAPI.put(`/update-episode/${editingId}`, data);
+                await EpisodeAPI.put(`/update-episode/${editingId}`, data, axiosConfig);
                 setSuccess('Episode updated successfully');
             } else {
-                await EpisodeAPI.post('/create-episode', data);
+                await EpisodeAPI.post('/create-episode', data, axiosConfig);
                 setSuccess('Episode created successfully');
             }
             await fetchEpisodes();
@@ -84,6 +101,9 @@ const Episodes = () => {
             setTimeout(() => setSuccess(''), 3000);
         } catch (err) {
             setError(err.response?.data?.error || err.message || 'Error saving episode');
+        } finally {
+            setIsUploading(false);
+            setUploadProgress(0);
         }
     };
 
@@ -98,6 +118,9 @@ const Episodes = () => {
             description: episode.description || '',
             duration: episode.duration || ''
         });
+        if (fileInputRef.current) {
+            fileInputRef.current.value = '';
+        }
         setEditingId(episode._id);
         setError('');
         window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -127,8 +150,14 @@ const Episodes = () => {
             description: '',
             duration: ''
         });
+        if (fileInputRef.current) {
+            fileInputRef.current.value = '';
+        }
         setEditingId(null);
         setError('');
+        setIsUploading(false);
+        setUploadProgress(0);
+        setUploadStats({ loaded: 0, total: 0, speed: 0, estimatedTime: null });
     };
 
     const getSeriesName = (seriesId) => {
@@ -154,6 +183,25 @@ const Episodes = () => {
         });
     };
 
+    const filteredEpisodes = episodes.filter((ep) => {
+        if (!searchTerm.trim()) return true;
+        const term = searchTerm.toLowerCase();
+        const epId = String(ep.episode_id || '');
+        const epNum = String(ep.episode_number || '');
+        const name = (ep.name || '').toLowerCase();
+        const seriesName = (getSeriesName(ep.series_id) || '').toLowerCase();
+        const seasonName = (getSeasonName(ep.season_id) || '').toLowerCase();
+        const file = (ep.file || '').toLowerCase();
+        const desc = (ep.description || '').toLowerCase();
+        return epId.includes(term) ||
+               epNum.includes(term) ||
+               name.includes(term) ||
+               seriesName.includes(term) ||
+               seasonName.includes(term) ||
+               file.includes(term) ||
+               desc.includes(term);
+    });
+
     return (
         <AdminLayout
             title="Episodes"
@@ -177,12 +225,13 @@ const Episodes = () => {
                     <form onSubmit={handleSubmit} encType="multipart/form-data">
                         <div className="row g-3">
                             <div className="col-md-6">
-                                <label className="form-label fw-semibold">TV Series *</label>
+                                <label className="form-label fw-semibold">Series *</label>
                                 <select
                                     value={formData.series_id}
                                     onChange={(e) => handleSeriesChange(e.target.value)}
                                     className="form-select"
                                     required
+                                    disabled={isUploading}
                                 >
                                     <option value="">-- Choose Series --</option>
                                     {series.map((s) => (
@@ -200,7 +249,7 @@ const Episodes = () => {
                                     onChange={(e) => handleSeasonChange(e.target.value)}
                                     className="form-select"
                                     required
-                                    disabled={!formData.series_id}
+                                    disabled={isUploading || !formData.series_id}
                                 >
                                     <option value="">-- Choose Season --</option>
                                     {seasons
@@ -223,6 +272,7 @@ const Episodes = () => {
                                     className="form-control"
                                     required
                                     min="1"
+                                    disabled={isUploading}
                                 />
                             </div>
 
@@ -235,6 +285,7 @@ const Episodes = () => {
                                     onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                                     className="form-control"
                                     required
+                                    disabled={isUploading}
                                 />
                             </div>
 
@@ -243,12 +294,20 @@ const Episodes = () => {
                                     Video File (.ts, .m3u8, .mp4) {editingId ? '(Optional if unchanged)' : '*'}
                                 </label>
                                 <input
+                                    ref={fileInputRef}
                                     type="file"
                                     accept=".ts,.m3u8,.mp4"
-                                    onChange={(e) => setFormData({ ...formData, file: e.target.files[0] })}
+                                    onChange={(e) => setFormData({ ...formData, file: e.target.files[0] || null })}
                                     className="form-control"
                                     required={!editingId}
+                                    disabled={isUploading}
                                 />
+                                {formData.file && (
+                                    <div className="mt-1 small text-success">
+                                        <i className="fa-solid fa-file-video me-1"></i>
+                                        Selected: <strong>{formData.file.name}</strong> ({formatBytes(formData.file.size)})
+                                    </div>
+                                )}
                             </div>
 
                             <div className="col-md-12">
@@ -259,17 +318,38 @@ const Episodes = () => {
                                     onChange={(e) => setFormData({ ...formData, description: e.target.value })}
                                     className="form-control"
                                     rows="2"
+                                    disabled={isUploading}
                                 />
                             </div>
                         </div>
 
+                        {/* Upload Progress Bar */}
+                        <UploadProgressBar
+                            uploading={isUploading}
+                            progress={uploadProgress}
+                            fileName={formData.file?.name}
+                            loaded={uploadStats.loaded}
+                            total={uploadStats.total}
+                            speed={uploadStats.speed}
+                            estimatedTime={uploadStats.estimatedTime}
+                        />
+
                         <div className="mt-4 d-flex gap-2">
-                            <button type="submit" className="btn btn-primary px-4">
-                                <i className="fa-solid fa-check me-1"></i>
-                                {editingId ? 'Update Episode' : 'Upload Episode'}
+                            <button type="submit" className="btn btn-primary px-4" disabled={isUploading}>
+                                {isUploading ? (
+                                    <>
+                                        <span className="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>
+                                        {uploadProgress < 100 ? `Uploading (${uploadProgress}%)...` : 'Processing Video...'}
+                                    </>
+                                ) : (
+                                    <>
+                                        <i className="fa-solid fa-check me-1"></i>
+                                        {editingId ? 'Update Episode' : 'Upload Episode'}
+                                    </>
+                                )}
                             </button>
                             {editingId && (
-                                <button type="button" onClick={resetForm} className="btn btn-secondary px-3">
+                                <button type="button" onClick={resetForm} className="btn btn-secondary px-3" disabled={isUploading}>
                                     Cancel
                                 </button>
                             )}
@@ -279,11 +359,17 @@ const Episodes = () => {
             </div>
 
             <div className="admin-card">
-                <div className="admin-card-header bg-light">
-                    <h3 className="admin-card-title">
+                <div className="admin-card-header bg-light d-flex flex-wrap align-items-center justify-content-between gap-2">
+                    <h3 className="admin-card-title mb-0">
                         <i className="fa-solid fa-film text-primary me-2"></i>
-                        Available Episodes ({episodes.length})
+                        Available Episodes ({searchTerm.trim() ? `${filteredEpisodes.length} of ${episodes.length}` : episodes.length})
                     </h3>
+                    <SearchBar
+                        value={searchTerm}
+                        onChange={setSearchTerm}
+                        placeholder="Search episodes..."
+                        style={{ minWidth: '220px', maxWidth: '320px' }}
+                    />
                 </div>
                 <div className="admin-card-body p-0">
                     <div className="table-responsive">
@@ -301,8 +387,8 @@ const Episodes = () => {
                                 </tr>
                             </thead>
                             <tbody>
-                                {episodes.length > 0 ? (
-                                    episodes.map((episode) => (
+                                {filteredEpisodes.length > 0 ? (
+                                    filteredEpisodes.map((episode) => (
                                         <tr key={episode._id}>
                                             <td className="fw-bold text-muted">#{episode.episode_id}</td>
                                             <td className="fw-semibold">{getSeriesName(episode.series_id)}</td>
@@ -338,7 +424,20 @@ const Episodes = () => {
                                 ) : (
                                     <tr>
                                         <td colSpan="8" className="text-center py-4 text-muted">
-                                            No episodes uploaded yet. Use the form above to add one.
+                                            {searchTerm.trim() ? (
+                                                <>
+                                                    <i className="fa-solid fa-search me-2"></i>
+                                                    No episodes found matching "<strong>{searchTerm}</strong>".
+                                                    <button
+                                                        className="btn btn-sm btn-link p-0 ms-2"
+                                                        onClick={() => setSearchTerm('')}
+                                                    >
+                                                        Clear search
+                                                    </button>
+                                                </>
+                                            ) : (
+                                                'No episodes uploaded yet. Use the form above to add one.'
+                                            )}
                                         </td>
                                     </tr>
                                 )}

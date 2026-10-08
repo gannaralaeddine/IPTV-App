@@ -10,7 +10,7 @@ const Sidebar = () => {
         dashboard: true, // open by default as in screenshot
         iptv: currentPath.includes('/live'),
         vod: currentPath.includes('/vod'),
-        series: currentPath.includes('/series') || currentPath.includes('/seasons') || currentPath.includes('/episodes'),
+        series: currentPath.includes('/series'),
         subscriber: false,
         epg: false,
         app: false,
@@ -31,7 +31,7 @@ const Sidebar = () => {
             {/* User panel */}
             <div className="user-panel">
                 <img
-                    src="https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=120&h=120&q=80"
+                    src="https://drive.usercontent.google.com/download?id=1TDMdmyWHXwBRZJ4uwAu6bHXx6XCPzyjf&export=view&authuser=0"
                     alt="Ala Eddine Gannar"
                     className="user-avatar-sidebar"
                     onError={(e) => {
@@ -100,7 +100,6 @@ const Sidebar = () => {
                             <i className="fa-solid fa-tv"></i>
                         </span>
                         <span className="sidebar-menu-title">IPTV Management</span>
-                        <span className="sidebar-menu-badge bg-info text-white">4</span>
                         <i className={`fa-solid fa-angle-${openMenus.iptv ? 'down' : 'left'} sidebar-menu-arrow`}></i>
                     </a>
                     {openMenus.iptv && (
@@ -128,7 +127,6 @@ const Sidebar = () => {
                             <i className="fa-solid fa-table-cells"></i>
                         </span>
                         <span className="sidebar-menu-title">VOD Management</span>
-                        <span className="sidebar-menu-badge bg-success text-white">new</span>
                         <i className={`fa-solid fa-angle-${openMenus.vod ? 'down' : 'left'} sidebar-menu-arrow`}></i>
                     </a>
                     {openMenus.vod && (
@@ -150,7 +148,7 @@ const Sidebar = () => {
                 </li>
 
                 {/* Series Management */}
-                <li className={`${currentPath.includes('/series') || currentPath.includes('/seasons') || currentPath.includes('/episodes') ? 'active' : ''} ${openMenus.series ? 'expanded' : ''}`}>
+                <li className={`${currentPath.includes('/series') ? 'active' : ''} ${openMenus.series ? 'expanded' : ''}`}>
                     <a href="#!" onClick={(e) => { e.preventDefault(); toggleMenu('series'); }}>
                         <span className="sidebar-menu-icon">
                             <i className="fa-solid fa-film"></i>
@@ -170,18 +168,6 @@ const Sidebar = () => {
                                 <Link to="/series-streams">
                                     <i className="fa-regular fa-circle treeview-menu-icon"></i>
                                     Series Streams
-                                </Link>
-                            </li>
-                            <li className={currentPath === '/seasons' ? 'active' : ''}>
-                                <Link to="/seasons">
-                                    <i className="fa-regular fa-circle treeview-menu-icon"></i>
-                                    Seasons
-                                </Link>
-                            </li>
-                            <li className={currentPath === '/episodes' ? 'active' : ''}>
-                                <Link to="/episodes">
-                                    <i className="fa-regular fa-circle treeview-menu-icon"></i>
-                                    Episodes
                                 </Link>
                             </li>
                         </ul>

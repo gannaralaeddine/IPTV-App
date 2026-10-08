@@ -89,9 +89,12 @@ IPTV-App/
 │       │   ├── VodCategories.js  # VOD (Movies) category administration
 │       │   ├── VodStreams.js     # VOD stream management and file uploads
 │       │   ├── SeriesCategories.js # Series category administration
-│       │   ├── SeriesStreams.js  # Series show administration
-│       │   ├── Seasons.js        # Season administration
+│       │   ├── SeriesStreams.js  # Series show administration (with Seasons popup)
+│       │   ├── Seasons.js        # Season administration (with Episodes popup)
 │       │   ├── Episodes.js       # Episode stream management and file uploads
+│       │   ├── SeasonsModal.js   # Seasons management popup modal for a specific series
+│       │   ├── EpisodesModal.js  # Episodes management & upload popup modal for a specific season
+│       │   ├── UploadProgressBar.js # Real-time file upload progress bar & stats
 │       │   └── layout/           # Shared UI Layout
 │       │       ├── AdminLayout.js
 │       │       ├── Navbar.js
