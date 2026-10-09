@@ -1,15 +1,19 @@
 import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import AdminLayout from './layout/AdminLayout';
-import { LiveAPI, VodAPI, SeriesAPI } from '../services/api';
+import { LiveAPI, VodAPI, SeriesAPI, UserAPI } from '../services/api';
+import { useAuth } from '../context/AuthContext';
 
 const Dashboard = () => {
+    const { user, isSuperAdmin, canManageContent } = useAuth();
     const [chartTab, setChartTab] = useState('Area'); // 'Area' or 'Donut'
     const [stats, setStats] = useState({
-        liveStreams: 150,
-        vodStreams: 53,
-        seriesStreams: 44,
-        categories: 65,
+        liveStreams: 0,
+        vodStreams: 0,
+        seriesStreams: 0,
+        clientUsers: 0,
+        activeSubscribers: 0,
+        categories: 0,
         loading: true
     });
 
@@ -17,95 +21,149 @@ const Dashboard = () => {
     useEffect(() => {
         const fetchDashboardData = async () => {
             try {
-                const [liveRes, vodRes, seriesRes, liveCatRes] = await Promise.allSettled([
-                    LiveAPI.get('/live-streams'),
-                    VodAPI.get('/vod-streams'),
-                    SeriesAPI.get('/series-streams'),
-                    LiveAPI.get('/live-categories')
-                ]);
+                const promises = [
+                    UserAPI.get('/?role=client_user').catch(() => ({ data: [] }))
+                ];
+
+                if (canManageContent) {
+                    promises.push(LiveAPI.get('/live-streams').catch(() => ({ data: [] })));
+                    promises.push(VodAPI.get('/vod-streams').catch(() => ({ data: [] })));
+                    promises.push(SeriesAPI.get('/series-streams').catch(() => ({ data: [] })));
+                    promises.push(LiveAPI.get('/live-categories').catch(() => ({ data: [] })));
+                }
+
+                const results = await Promise.allSettled(promises);
+                const clientRes = results[0].status === 'fulfilled' ? results[0].value.data : [];
+                const liveRes = results[1]?.status === 'fulfilled' ? results[1].value.data : [];
+                const vodRes = results[2]?.status === 'fulfilled' ? results[2].value.data : [];
+                const seriesRes = results[3]?.status === 'fulfilled' ? results[3].value.data : [];
+                const catRes = results[4]?.status === 'fulfilled' ? results[4].value.data : [];
+
+                const activeSubs = clientRes.filter(c => c.status === 'active' && (!c.expDate || new Date(c.expDate) >= new Date())).length;
 
                 setStats({
-                    liveStreams: liveRes.status === 'fulfilled' && liveRes.value.data.length > 0 ? liveRes.value.data.length : 150,
-                    vodStreams: vodRes.status === 'fulfilled' && vodRes.value.data.length > 0 ? vodRes.value.data.length : '53%',
-                    seriesStreams: seriesRes.status === 'fulfilled' && seriesRes.value.data.length > 0 ? seriesRes.value.data.length : 44,
-                    categories: liveCatRes.status === 'fulfilled' && liveCatRes.value.data.length > 0 ? liveCatRes.value.data.length : 65,
+                    clientUsers: clientRes.length,
+                    activeSubscribers: activeSubs,
+                    liveStreams: liveRes.length || 0,
+                    vodStreams: vodRes.length || 0,
+                    seriesStreams: seriesRes.length || 0,
+                    categories: catRes.length || 0,
                     loading: false
                 });
             } catch (err) {
-                // Keep default demo stats from screenshot
                 setStats(prev => ({ ...prev, loading: false }));
             }
         };
 
         fetchDashboardData();
-    }, []);
+    }, [canManageContent]);
 
     return (
         <AdminLayout title="Dashboard" subtitle="Control panel">
+            {/* Welcome banner */}
+            <div className="alert alert-light border shadow-sm mb-4 d-flex flex-wrap align-items-center justify-content-between p-3">
+                <div className="d-flex align-items-center mb-2 mb-md-0">
+                    <div style={{
+                        width: '42px',
+                        height: '42px',
+                        borderRadius: '50%',
+                        backgroundColor: isSuperAdmin ? '#dd4b39' : '#3c8dbc',
+                        color: '#fff',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        fontWeight: 'bold',
+                        fontSize: '18px',
+                        marginRight: '12px'
+                    }}>
+                        {user?.name ? user.name.charAt(0).toUpperCase() : 'U'}
+                    </div>
+                    <div>
+                        <div className="fw-bold fs-6">Welcome back, {user?.name || 'Administrator'}!</div>
+                        <div className="small text-muted">
+                            Signed in as <span className={`badge ${isSuperAdmin ? 'bg-danger' : 'bg-primary'}`}>{user?.role ? user.role.toUpperCase() : 'ADMIN'}</span>
+                            {isSuperAdmin
+                                ? ' — You have full Super Admin privileges (Live, VOD, Series, Users & Roles).'
+                                : ' — You can generate client accounts and configure category visibility.'}
+                        </div>
+                    </div>
+                </div>
+                <div className="d-flex gap-2">
+                    <Link to="/client-users" className="btn btn-sm btn-success fw-bold">
+                        <i className="fa-solid fa-wand-magic-sparkles me-1"></i> Generate Client Account
+                    </Link>
+                    {isSuperAdmin && (
+                        <Link to="/users" className="btn btn-sm btn-outline-danger fw-bold">
+                            <i className="fa-solid fa-users-gear me-1"></i> Manage All Users
+                        </Link>
+                    )}
+                </div>
+            </div>
+
             {/* ====================================================
                 4 Small Stat Boxes (AdminLTE)
                ==================================================== */}
             <div className="row">
-                {/* 1. Aqua Box: New Orders */}
+                {/* 1. Green Box: Active Subscribers */}
+                <div className="col-lg-3 col-6">
+                    <div className="small-box small-box-green">
+                        <div className="inner">
+                            <h3>{stats.activeSubscribers}</h3>
+                            <p>Active Subscribers</p>
+                        </div>
+                        <div className="icon">
+                            <i className="fa-solid fa-user-check"></i>
+                        </div>
+                        <Link to="/client-users" className="small-box-footer">
+                            Manage Subscribers <i className="fa-solid fa-circle-arrow-right ms-1"></i>
+                        </Link>
+                    </div>
+                </div>
+
+                {/* 2. Aqua Box: Live Streams */}
                 <div className="col-lg-3 col-6">
                     <div className="small-box small-box-aqua">
                         <div className="inner">
                             <h3>{stats.liveStreams}</h3>
-                            <p>New Orders</p>
+                            <p>Live TV Streams</p>
                         </div>
                         <div className="icon">
-                            <i className="fa-solid fa-bag-shopping"></i>
+                            <i className="fa-solid fa-tv"></i>
                         </div>
-                        <Link to="/live-streams" className="small-box-footer">
-                            More info <i className="fa-solid fa-circle-arrow-right ms-1"></i>
+                        <Link to={canManageContent ? "/live-streams" : "/client-users"} className="small-box-footer">
+                            {canManageContent ? 'Manage Live TV' : 'View Subscriptions'} <i className="fa-solid fa-circle-arrow-right ms-1"></i>
                         </Link>
                     </div>
                 </div>
 
-                {/* 2. Green Box: Bounce Rate */}
-                <div className="col-lg-3 col-6">
-                    <div className="small-box small-box-green">
-                        <div className="inner">
-                            <h3>{typeof stats.vodStreams === 'number' ? `${stats.vodStreams}%` : stats.vodStreams}</h3>
-                            <p>Bounce Rate</p>
-                        </div>
-                        <div className="icon">
-                            <i className="fa-solid fa-chart-column"></i>
-                        </div>
-                        <Link to="/vod-streams" className="small-box-footer">
-                            More info <i className="fa-solid fa-circle-arrow-right ms-1"></i>
-                        </Link>
-                    </div>
-                </div>
-
-                {/* 3. Yellow Box: User Registrations */}
+                {/* 3. Yellow Box: VOD Movies & Series */}
                 <div className="col-lg-3 col-6">
                     <div className="small-box small-box-yellow">
                         <div className="inner">
-                            <h3>{stats.seriesStreams}</h3>
-                            <p>User Registrations</p>
+                            <h3>{stats.vodStreams + stats.seriesStreams}</h3>
+                            <p>VOD & TV Series</p>
                         </div>
                         <div className="icon">
-                            <i className="fa-solid fa-user-plus"></i>
+                            <i className="fa-solid fa-film"></i>
                         </div>
-                        <Link to="/series-streams" className="small-box-footer">
-                            More info <i className="fa-solid fa-circle-arrow-right ms-1"></i>
+                        <Link to={canManageContent ? "/vod-streams" : "/client-users"} className="small-box-footer">
+                            {canManageContent ? 'Manage VOD' : 'View Subscriptions'} <i className="fa-solid fa-circle-arrow-right ms-1"></i>
                         </Link>
                     </div>
                 </div>
 
-                {/* 4. Red Box: Unique Visitors */}
+                {/* 4. Red Box: Total Client Accounts */}
                 <div className="col-lg-3 col-6">
                     <div className="small-box small-box-red">
                         <div className="inner">
-                            <h3>{stats.categories}</h3>
-                            <p>Unique Visitors</p>
+                            <h3>{stats.clientUsers}</h3>
+                            <p>Total Client Accounts</p>
                         </div>
                         <div className="icon">
-                            <i className="fa-solid fa-chart-pie"></i>
+                            <i className="fa-solid fa-id-card"></i>
                         </div>
-                        <Link to="/episodes" className="small-box-footer">
-                            More info <i className="fa-solid fa-circle-arrow-right ms-1"></i>
+                        <Link to="/client-users" className="small-box-footer">
+                            View Accounts <i className="fa-solid fa-circle-arrow-right ms-1"></i>
                         </Link>
                     </div>
                 </div>

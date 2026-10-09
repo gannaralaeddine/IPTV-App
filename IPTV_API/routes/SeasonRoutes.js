@@ -1,6 +1,10 @@
 const { Router } = require('express');
 const adminSeasonController = require('../controllers/adminSeasonController');
+const { authenticateToken, requireSuperAdmin } = require('../middleware/authMiddleware');
 const router = Router();
+
+// Only super_admin has access to Seasons management
+router.use(authenticateToken, requireSuperAdmin);
 
 // Season Routes
 router.get("/seasons", adminSeasonController.getSeasons);

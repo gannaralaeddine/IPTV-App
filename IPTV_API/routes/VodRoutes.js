@@ -4,7 +4,11 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const config = require('../config/config');
+const { authenticateToken, requireSuperAdmin } = require('../middleware/authMiddleware');
 const router = Router();
+
+// Only super_admin has access to VOD management
+router.use(authenticateToken, requireSuperAdmin);
 
 // Multer storage configuration for VOD
 const vodStorage = multer.diskStorage({

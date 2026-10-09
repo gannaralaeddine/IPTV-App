@@ -8,41 +8,39 @@ const Season = require('./models/Season');
 const Episode = require('./models/Episode');
 const VodCategory = require('./models/VodCategory');
 const VodStream = require('./models/VodStream');
+const User = require('./models/User');
 const path = require("path");
 const fs = require("fs");
 const cors = require('cors');
 
 const bodyParser = require('body-parser');
 
-
-
 const config = require('./config/config');
 const db = config.URL;
 const PORT = config.PORT;
 
-const adminRoutes = require('./routes/adminRoutes')
-const vodRoutes = require('./routes/VodRoutes')
-const seriesRoutes = require('./routes/SeriesRoutes')
-const seasonRoutes = require('./routes/SeasonRoutes')
-const episodeRoutes = require('./routes/EpisodeRoutes')
+const adminRoutes = require('./routes/adminRoutes');
+const vodRoutes = require('./routes/VodRoutes');
+const seriesRoutes = require('./routes/SeriesRoutes');
+const seasonRoutes = require('./routes/SeasonRoutes');
+const episodeRoutes = require('./routes/EpisodeRoutes');
+const userRoutes = require('./routes/userRoutes');
+const initSuperAdmin = require('./config/initSuperAdmin');
 
 const app = express();
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-const USERNAME = 'test';
-const PASSWORD = 'test';
-
-// Note: Multer configuration is now handled in individual route files
-
-// Connect MongoDB (adjust URI if needed)
+// Connect MongoDB and initialize default accounts
 mongoose
     .connect(db)
-    .then(()=>{
+    .then(async () => {
         console.log('MongoDB connected...');
         console.log('Database URL:', db);
-        // Check if the collection exists and has data
+        // Initialize default Super Admin, Admin, and test Client
+        await initSuperAdmin();
+
         mongoose.connection.db.listCollections().toArray()
             .then((collections) => {
                 console.log('Available collections:', collections.map(c => c.name));
@@ -51,12 +49,10 @@ mongoose
                 console.log('Error listing collections:', err);
             });
     })
-    .catch(err=> console.log('MongoDB error:', err))
+    .catch(err => console.log('MongoDB error:', err));
 
-
-// app.use(cors());
 app.use(cors({
-    origin: '*', // Or specify allowed origins, e.g., ['http://localhost', 'https://yourapp.com']
+    origin: '*',
     methods: ['GET', 'POST', 'PUT', 'OPTIONS', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
@@ -69,27 +65,78 @@ app.use((req, res, next) => {
         body: req.body
     });
     next();
-
 });
 
-
+// Admin and Management Routes
+app.use('/admin/users', userRoutes);
+app.use('/admin-users', userRoutes);
+app.use('/auth', userRoutes);
 app.use('/admin', adminRoutes);
 app.use('/admin-vod', vodRoutes);
 app.use('/admin-series', seriesRoutes);
 app.use('/admin-seasons', seasonRoutes);
 app.use('/admin-episodes', episodeRoutes);
 
-// Simple auth check
-// function auth(req) {
-//     return req.query.username === USERNAME && req.query.password === PASSWORD;
-// }
+// Category permission check helpers for Client Users
+function isLiveCategoryAllowed(user, categoryId) {
+    if (!user || user.role !== 'client_user' || user.allLiveCategories) return true;
+    return Array.isArray(user.allowedLiveCategories) && user.allowedLiveCategories.includes(Number(categoryId));
+}
 
+function isVodCategoryAllowed(user, categoryId) {
+    if (!user || user.role !== 'client_user' || user.allVodCategories) return true;
+    return Array.isArray(user.allowedVodCategories) && user.allowedVodCategories.includes(Number(categoryId));
+}
 
-// Auth middleware
-function auth(req) {
-    const username = Array.isArray(req.query.username) ? req.query.username[0] : req.query.username || req.headers['x-username'] || req.body.username;
-    const password = Array.isArray(req.query.password) ? req.query.password[0] : req.query.password || req.headers['x-password'] || req.body.password;
-    return username === USERNAME && password === PASSWORD;
+function isSeriesCategoryAllowed(user, categoryId) {
+    if (!user || user.role !== 'client_user' || user.allSeriesCategories) return true;
+    return Array.isArray(user.allowedSeriesCategories) && user.allowedSeriesCategories.includes(Number(categoryId));
+}
+
+// Authenticate client for Xtream player_api.php and get.php
+async function authenticateClient(req) {
+    const rawUsername = Array.isArray(req.query?.username) ? req.query.username[0] : req.query?.username || req.headers['x-username'] || req.body?.username;
+    const rawPassword = Array.isArray(req.query?.password) ? req.query.password[0] : req.query?.password || req.headers['x-password'] || req.body?.password;
+
+    if (!rawUsername || !rawPassword) {
+        return { authenticated: false, message: "Missing credentials" };
+    }
+
+    const cleanUsername = String(rawUsername).trim().toLowerCase();
+    const user = await User.findOne({ username: cleanUsername });
+
+    if (!user) {
+        return { authenticated: false, message: "Invalid credentials" };
+    }
+
+    const isMatch = await user.comparePassword(String(rawPassword));
+    if (!isMatch) {
+        return { authenticated: false, message: "Invalid credentials" };
+    }
+
+    if (user.status !== 'active') {
+        return { authenticated: false, message: "Account disabled or banned", status: "Blocked" };
+    }
+
+    if (user.role === 'client_user' && user.expDate && new Date(user.expDate) < new Date()) {
+        return { authenticated: false, message: "Subscription expired", status: "Expired" };
+    }
+
+    return { authenticated: true, user, rawPassword: String(rawPassword) };
+}
+
+// Authenticate direct stream requests (/live/:username/:password/..., etc.)
+async function authenticateStreamAccess(req) {
+    const { username, password } = req.params;
+    if (!username || !password) return null;
+    const cleanUsername = String(username).trim().toLowerCase();
+    const user = await User.findOne({ username: cleanUsername });
+    if (!user) return null;
+    const isMatch = await user.comparePassword(String(password));
+    if (!isMatch) return null;
+    if (user.status !== 'active') return null;
+    if (user.role === 'client_user' && user.expDate && new Date(user.expDate) < new Date()) return null;
+    return user;
 }
 
 // Handle OPTIONS requests for player_api.php
@@ -126,14 +173,25 @@ async function handlePlayerApi(req, res) {
         body: req.body
     });
 
-    // Check authentication
-    const isAuthenticated = auth(req);
-    console.log('Authentication result:', isAuthenticated);
+    // Check authentication against database User collection
+    const authResult = await authenticateClient(req);
+    console.log('Authentication result:', authResult.authenticated, authResult.message || '');
     
-    if (!isAuthenticated) {
+    if (!authResult.authenticated) {
         console.log('Authentication failed - returning blocked response');
-        return res.status(200).json({ user_info: { auth: 0, status: "Blocked", username: "", password: "", message: "Invalid credentials" } });
+        return res.status(200).json({
+            user_info: {
+                auth: 0,
+                status: authResult.status || "Blocked",
+                username: "",
+                password: "",
+                message: authResult.message || "Invalid credentials"
+            }
+        });
     }
+
+    const authUser = authResult.user;
+    const clientPass = authUser.rawPassword || authResult.rawPassword || "******";
 
     // Merge query and body parameters (some clients send via POST body)
     const params = { ...req.query, ...req.body };
@@ -150,17 +208,20 @@ async function handlePlayerApi(req, res) {
             console.log('No action specified - returning user_info and server_info');
             const hostHeader = req.get('host') || '';
             const hostOnly = hostHeader.split(':')[0];
+            const expTimestamp = authUser.expDate ? Math.floor(new Date(authUser.expDate).getTime() / 1000).toString() : "1769717936";
+            const createdTimestamp = authUser.createdAt ? Math.floor(new Date(authUser.createdAt).getTime() / 1000).toString() : "1699717936";
+            
             const response = {
                 user_info: {
-                    username: USERNAME,
-                    password: PASSWORD,
+                    username: authUser.username,
+                    password: clientPass,
                     auth: 1,
                     status: "Active",
-                    exp_date: "1769717936",
+                    exp_date: expTimestamp,
                     is_trial: "0",
                     active_cons: "0",
-                    created_at: "1699717936",
-                    max_connections: "1",
+                    created_at: createdTimestamp,
+                    max_connections: String(authUser.maxConnections || 1),
                     allowed_output_formats: ["m3u8", "ts", "rtmp"]
                 },
                 server_info: {
@@ -181,8 +242,14 @@ async function handlePlayerApi(req, res) {
         if (action === 'get_live_categories')
         {
             try {
-                console.log("Getting Live Categories")
-                const categories = await LiveCategory.find().lean();
+                console.log("Getting Live Categories");
+                let catFilter = {};
+                // Filter categories if client user has restricted category access
+                if (authUser.role === 'client_user' && !authUser.allLiveCategories) {
+                    catFilter = { category_id: { $in: authUser.allowedLiveCategories || [] } };
+                }
+
+                const categories = await LiveCategory.find(catFilter).lean();
 
                 const formatted = categories.map(c => ({
                     category_id: String(c.category_id),
@@ -190,7 +257,6 @@ async function handlePlayerApi(req, res) {
                     parent_id: c.parent_id || 0
                 }));
 
-                // res.setHeader('Content-Type', 'application/json');
                 return res.json(formatted);
             } catch (error) {
                 console.error("Error fetching live categories:", error);
@@ -200,9 +266,20 @@ async function handlePlayerApi(req, res) {
 
         if (action === 'get_live_streams')
         {
-            console.log("Getting Live Streams")
+            console.log("Getting Live Streams");
             const parsedCategoryId = Number(category_id);
-            const filter = Number.isFinite(parsedCategoryId) ? { category_id: parsedCategoryId } : {};
+            let filter = Number.isFinite(parsedCategoryId) ? { category_id: parsedCategoryId } : {};
+
+            // Category restriction for client user
+            if (authUser.role === 'client_user' && !authUser.allLiveCategories) {
+                if (Number.isFinite(parsedCategoryId)) {
+                    if (!isLiveCategoryAllowed(authUser, parsedCategoryId)) {
+                        return res.json([]);
+                    }
+                } else {
+                    filter = { category_id: { $in: authUser.allowedLiveCategories || [] } };
+                }
+            }
 
             const streams = await LiveStream.find(filter).lean();
 
@@ -226,8 +303,13 @@ async function handlePlayerApi(req, res) {
 
         if (action === 'get_series_categories')
         {
-            console.log("Getting Series Categories")
-            const categories = await SeriesCategory.find().lean();
+            console.log("Getting Series Categories");
+            let catFilter = {};
+            if (authUser.role === 'client_user' && !authUser.allSeriesCategories) {
+                catFilter = { category_id: { $in: authUser.allowedSeriesCategories || [] } };
+            }
+
+            const categories = await SeriesCategory.find(catFilter).lean();
             const formatted = categories.map(c => ({
                 category_id: String(c.category_id),
                 category_name: c.category_name,
@@ -240,7 +322,18 @@ async function handlePlayerApi(req, res) {
         {
             console.log("Getting series for category_id:", category_id);
             const parsedCategoryId = Number(category_id);
-            const filter = Number.isFinite(parsedCategoryId) ? { category_id: parsedCategoryId } : {};
+            let filter = Number.isFinite(parsedCategoryId) ? { category_id: parsedCategoryId } : {};
+
+            if (authUser.role === 'client_user' && !authUser.allSeriesCategories) {
+                if (Number.isFinite(parsedCategoryId)) {
+                    if (!isSeriesCategoryAllowed(authUser, parsedCategoryId)) {
+                        return res.json([]);
+                    }
+                } else {
+                    filter = { category_id: { $in: authUser.allowedSeriesCategories || [] } };
+                }
+            }
+
             const series = await SeriesStream.find(filter).lean();
             console.log(`Found ${series.length} series in database`);
             
@@ -258,17 +351,21 @@ async function handlePlayerApi(req, res) {
                 category_id: s.category_id,
                 container_extension: "mp4",
                 custom_sid: "",
-                direct_source: `${base}/series/${USERNAME}/${PASSWORD}/${s.series_id}.mp4`
+                direct_source: `${base}/series/${authUser.username}/${clientPass}/${s.series_id}.mp4`
             }));
             
-            console.log("Series response:", JSON.stringify(response, null, 2));
             return res.json(response);
         }
 
         if (action === 'get_vod_categories')
         {
-            console.log("Getting VOD Categories")
-            const categories = await VodCategory.find().lean();
+            console.log("Getting VOD Categories");
+            let catFilter = {};
+            if (authUser.role === 'client_user' && !authUser.allVodCategories) {
+                catFilter = { category_id: { $in: authUser.allowedVodCategories || [] } };
+            }
+
+            const categories = await VodCategory.find(catFilter).lean();
             const formatted = categories.map(c => ({
                 category_id: String(c.category_id),
                 category_name: c.category_name,
@@ -281,8 +378,18 @@ async function handlePlayerApi(req, res) {
         {
             console.log("Getting VOD Streams");
             const parsedCategoryId = Number(category_id);
-            const filter = Number.isFinite(parsedCategoryId) ? { category_id: parsedCategoryId } : {};
-            console.log("VOD filter:", filter);
+            let filter = Number.isFinite(parsedCategoryId) ? { category_id: parsedCategoryId } : {};
+
+            if (authUser.role === 'client_user' && !authUser.allVodCategories) {
+                if (Number.isFinite(parsedCategoryId)) {
+                    if (!isVodCategoryAllowed(authUser, parsedCategoryId)) {
+                        return res.json([]);
+                    }
+                } else {
+                    filter = { category_id: { $in: authUser.allowedVodCategories || [] } };
+                }
+            }
+
             const vods = await VodStream.find(filter).lean();
             console.log("VODs found:", vods.length);
             const hostHeader = req.get('host') || '';
@@ -301,7 +408,7 @@ async function handlePlayerApi(req, res) {
                     category_id: Number.isFinite(Number(v.category_id)) ? Number(v.category_id) : 0,
                     container_extension: fileExt,
                     custom_sid: "",
-                    direct_source: `${base}/movie/${USERNAME}/${PASSWORD}/${v.vod_id || i + 1}.${fileExt}`,
+                    direct_source: `${base}/movie/${authUser.username}/${clientPass}/${v.vod_id || i + 1}.${fileExt}`,
                     rating: v.rating || "0",
                     epg_channel_id: null,
                     tv_archive: 0,
@@ -312,7 +419,6 @@ async function handlePlayerApi(req, res) {
             });
             return res.json(response);
         }
-
 
         if (action === 'get_vod_info')
         {
@@ -326,6 +432,12 @@ async function handlePlayerApi(req, res) {
                 if (!vod) {
                     return res.status(404).json({ error: 'VOD not found' });
                 }
+
+                // Check category permission
+                if (!isVodCategoryAllowed(authUser, vod.category_id)) {
+                    return res.status(403).json({ error: 'Access to this VOD category is not permitted' });
+                }
+
                 const hostHeader = req.get('host') || '';
                 const hostOnly = hostHeader.split(':')[0];
                 const base = `http://${hostOnly}:${PORT}`;
@@ -341,7 +453,7 @@ async function handlePlayerApi(req, res) {
                         plot: vod.plot,
                         stream_type: 'movie',
                         container_extension: vod.container_extension || 'mp4',
-                        direct_source: `${base}/movie/${USERNAME}/${PASSWORD}/${vod_id}.mp4`,
+                        direct_source: `${base}/movie/${authUser.username}/${clientPass}/${vod_id}.mp4`,
                         rating: vod.rating || '0',
                         added: vod.added ? new Date(vod.added).toISOString() : '',
                         category_id: String(vod.category_id || 0),
@@ -352,11 +464,7 @@ async function handlePlayerApi(req, res) {
                         genre: vod.genre,
                         cast: vod.casts,
                     }
-                }
-                console.log("__________________________________________________________________________________");
-                console.log("VOD info response:", JSON.stringify(vod, null, 2));
-                console.log("*******************************************************************************:");
-                console.log("VOD info response:", JSON.stringify(response, null, 2));
+                };
                 return res.json(response);
             } catch (err) {
                 console.error('Error fetching VOD:', err);
@@ -370,38 +478,32 @@ async function handlePlayerApi(req, res) {
             let validSeriesId = series_id;
             
             if (!series_id || isNaN(series_id) || parseInt(series_id) <= 0) {
-                console.log("Invalid series_id:", series_id, "- Trying to find first available series");
-                
-                // Try to find the first available series as a fallback
                 const firstSeries = await SeriesStream.findOne().sort({ series_id: 1 }).lean();
                 if (firstSeries) {
-                    console.log("Found first series as fallback:", firstSeries.name, "with series_id:", firstSeries.series_id);
                     validSeriesId = firstSeries.series_id;
                 } else {
-                    console.log("No series found in database");
                     return res.status(400).json({ error: 'Invalid series ID. No series streams exist in the database.' });
                 }
             }
             try {
                 const series = await SeriesStream.findOne({ series_id: parseInt(validSeriesId) }).lean();
                 if (!series) {
-                    console.log("Series not found for series_id:", validSeriesId);
                     return res.status(404).json({ error: 'Series not found' });
+                }
+
+                // Check category permission
+                if (!isSeriesCategoryAllowed(authUser, series.category_id)) {
+                    return res.status(403).json({ error: 'Access to this Series category is not permitted' });
                 }
                 
                 // Get seasons for this series
                 const seasons = await Season.find({ series_id: parseInt(validSeriesId) }).sort({ season_number: 1 }).lean();
-                console.log(`Found ${seasons.length} seasons for series ${validSeriesId}`);
-                
-                // Get episodes for this series
                 const episodes = await Episode.find({ series_id: parseInt(validSeriesId) }).sort({ season_number: 1, episode_number: 1 }).lean();
-                console.log(`Found ${episodes.length} episodes for series ${validSeriesId}`);
                 
                 const hostHeader = req.get('host') || '';
                 const hostOnly = hostHeader.split(':')[0];
                 const base = `http://${hostOnly}:${PORT}`;
                 
-                // Format seasons data
                 const seasonsData = seasons.map(season => ({
                     air_date: season.added ? new Date(season.added).toISOString() : '',
                     episode_count: episodes.filter(ep => ep.season_id === season.season_id).length,
@@ -413,7 +515,6 @@ async function handlePlayerApi(req, res) {
                     cover_big: season.cover || ''
                 }));
                 
-                // Format episodes data by season
                 const episodesData = {};
                 seasons.forEach(season => {
                     const seasonEpisodes = episodes
@@ -435,7 +536,7 @@ async function handlePlayerApi(req, res) {
                             custom_sid: '',
                             added: episode.added ? new Date(episode.added).toISOString() : '',
                             season: episode.season_number,
-                            direct_source: `${base}/episode/${USERNAME}/${PASSWORD}/${episode.episode_id}.mp4`
+                            direct_source: `${base}/episode/${authUser.username}/${clientPass}/${episode.episode_id}.mp4`
                         }));
                     
                     episodesData[season.season_number] = seasonEpisodes;
@@ -455,12 +556,11 @@ async function handlePlayerApi(req, res) {
                         last_modified: series.added ? new Date(series.added).toISOString() : new Date().toISOString(),
                         stream_type: 'series',
                         container_extension: series.container_extension || 'mp4',
-                        direct_source: `${base}/series/${USERNAME}/${PASSWORD}/${validSeriesId}.mp4`
+                        direct_source: `${base}/series/${authUser.username}/${clientPass}/${validSeriesId}.mp4`
                     },
                     seasons: seasonsData,
                     episodes: episodesData
                 };
-                console.log("Series info response:", JSON.stringify(response, null, 2));
                 return res.json(response);
             } catch (err) {
                 console.error('Error fetching series info:', err);
@@ -481,61 +581,62 @@ app.post('/player_api.php', handlePlayerApi);
 
 // Xtream Codes playlist endpoint
 app.get('/get.php', async (req, res) => {
-    const { username, password, type, output } = req.query;
-
-    console.log('Request query:', req.query);
-    console.log('get.php__________________________________________________');
-    console.log('get.php called with:', {
-        query: req.query,
-        headers: req.headers,
-        ip: req.ip
-    });
-
-    if (!auth(req)) {
-        return res.status(403).send("Forbidden");
+    const authResult = await authenticateClient(req);
+    if (!authResult.authenticated) {
+        return res.status(403).send("Forbidden: Invalid credentials or expired account");
     }
 
+    const authUser = authResult.user;
+    const clientPass = authUser.rawPassword || authResult.rawPassword || 'password';
     const host = req.hostname;
     const base = `http://${host}:${PORT}`;
+    const { type } = req.query;
 
     let lines = [
-        `#EXTM3U url-tvg="${base}/xmltv.php?username=${USERNAME}&password=${PASSWORD}" x-tvg-url="${base}/xmltv.php?username=${USERNAME}&password=${PASSWORD}"`,
+        `#EXTM3U url-tvg="${base}/xmltv.php?username=${authUser.username}&password=${clientPass}" x-tvg-url="${base}/xmltv.php?username=${authUser.username}&password=${clientPass}"`,
     ];
 
     try {
         if (!type || type === 'm3u' || type === 'live' || type === 'LIVE')
         {
-            console.log("Serving Live")
-
-            const live = await LiveStream.find().lean();
+            let liveFilter = {};
+            if (authUser.role === 'client_user' && !authUser.allLiveCategories) {
+                liveFilter = { category_id: { $in: authUser.allowedLiveCategories || [] } };
+            }
+            const live = await LiveStream.find(liveFilter).lean();
             live.forEach(s => {
                 const logo = s.stream_icon || '';
                 lines.push(`#EXTINF:-1 tvg-id="${s.stream_id}" tvg-name="${s.name}" tvg-logo="${logo}" group-title="Live",${s.name}`);
-                lines.push(`${base}/live/${USERNAME}/${PASSWORD}/${s.stream_id}.ts`);
+                lines.push(`${base}/live/${authUser.username}/${clientPass}/${s.stream_id}.ts`);
             });
         }
 
         if (!type || type === 'm3u' || type === 'movie' || type === 'vod' || type === "VOD")
         {
-            const vods = await VodStream.find().lean();
+            let vodFilter = {};
+            if (authUser.role === 'client_user' && !authUser.allVodCategories) {
+                vodFilter = { category_id: { $in: authUser.allowedVodCategories || [] } };
+            }
+            const vods = await VodStream.find(vodFilter).lean();
             vods.forEach(v => {
                 lines.push(`#EXTINF:-1 group-title="VOD",${v.name}`);
-                lines.push(`${base}/movie/${USERNAME}/${PASSWORD}/${v.vod_id}.mp4`);
+                lines.push(`${base}/movie/${authUser.username}/${clientPass}/${v.vod_id}.mp4`);
             });
         }
 
         if (!type || type === 'm3u' || type === 'series' || type === "SERIES")
         {
-            // const series = await SeriesStream.find().lean();
-            // series.forEach(s => {
-            //     lines.push(`#EXTINF:-1 group-title="SERIES",${s.name}`);
-            //     lines.push(`${base}/series/${USERNAME}/${PASSWORD}/${s.series_id}.mp4`);
-            // });
+            let seriesFilter = {};
+            if (authUser.role === 'client_user' && !authUser.allSeriesCategories) {
+                seriesFilter = { category_id: { $in: authUser.allowedSeriesCategories || [] } };
+            }
+            const seriesList = await SeriesStream.find(seriesFilter).lean();
+            const allowedSeriesIds = seriesList.map(s => s.series_id);
 
-            const episodes = await Episode.find().lean();
+            const episodes = await Episode.find({ series_id: { $in: allowedSeriesIds } }).lean();
             episodes.forEach(episode => {
                 lines.push(`#EXTINF:-1 group-title="SERIES",${episode.name}`);
-                lines.push(`${base}/series/${USERNAME}/${PASSWORD}/${episode.episode_id}.mp4`);
+                lines.push(`${base}/series/${authUser.username}/${clientPass}/${episode.episode_id}.mp4`);
             });
         }
 
@@ -589,41 +690,10 @@ app.get('/debug/episodes', async (req, res) => {
     }
 });
 
-
-
-
 // Serve live streams
 app.get('/live/:username/:password/:stream_id', async (req, res) => {
-    if (req.params.username !== USERNAME || req.params.password !== PASSWORD)
-    {
-        return res.status(403).send("Forbidden");
-    }
-    let  liveStreams = []
-
-    try
-    {
-        liveStreams = await LiveStream.find().lean();
-
-    } catch (error) {
-        console.error("Error fetching live streams:", error);
-        return res.status(500).json({error: "Failed to fetch live streams"});
-    }
-
-
-    const streamId = parseInt(req.params.stream_id);
-    const stream = liveStreams.find(s => s.stream_id === streamId);
-    if (!stream) return res.status(404).send("Stream not found");
-
-    const filePath = path.join(config.LIVE_DIR, stream.file);
-    if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
-
-    streamFile(req, res, filePath);
-});
-
-// Some players require an explicit container extension in the URL
-app.get('/live/:username/:password/:stream_id.:ext', async (req, res) => {
-    if (req.params.username !== USERNAME || req.params.password !== PASSWORD)
-    {
+    const authUser = await authenticateStreamAccess(req);
+    if (!authUser) {
         return res.status(403).send("Forbidden");
     }
 
@@ -639,6 +709,39 @@ app.get('/live/:username/:password/:stream_id.:ext', async (req, res) => {
     const stream = liveStreams.find(s => s.stream_id === streamId);
     if (!stream) return res.status(404).send("Stream not found");
 
+    if (!isLiveCategoryAllowed(authUser, stream.category_id)) {
+        return res.status(403).send("Category not permitted for this client");
+    }
+
+    const filePath = path.join(config.LIVE_DIR, stream.file);
+    if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
+
+    streamFile(req, res, filePath);
+});
+
+// Some players require an explicit container extension in the URL
+app.get('/live/:username/:password/:stream_id.:ext', async (req, res) => {
+    const authUser = await authenticateStreamAccess(req);
+    if (!authUser) {
+        return res.status(403).send("Forbidden");
+    }
+
+    let liveStreams = [];
+    try {
+        liveStreams = await LiveStream.find().lean();
+    } catch (error) {
+        console.error("Error fetching live streams:", error);
+        return res.status(500).json({ error: "Failed to fetch live streams" });
+    }
+
+    const streamId = parseInt(req.params.stream_id);
+    const stream = liveStreams.find(s => s.stream_id === streamId);
+    if (!stream) return res.status(404).send("Stream not found");
+
+    if (!isLiveCategoryAllowed(authUser, stream.category_id)) {
+        return res.status(403).send("Category not permitted for this client");
+    }
+
     const filePath = path.join(config.LIVE_DIR, stream.file);
     if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
 
@@ -653,70 +756,6 @@ app.get('/live/:username/:password/:stream_id.:ext', async (req, res) => {
     streamFile(req, res, filePath, contentType);
 });
 
-function streamFile(req, res, filePath, overrideContentType) {
-    const stat = fs.statSync(filePath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
-    const contentType = overrideContentType || 'video/mp4';
-    
-    // Generate ETag for the file
-    const etag = `"${stat.mtime.getTime().toString(16)}-${stat.size.toString(16)}"`;
-    
-    // Check if client has the same version (ETag match)
-    if (req.headers['if-none-match'] === etag) {
-        res.writeHead(304, {
-            'ETag': etag,
-            'Cache-Control': 'public, max-age=31536000',
-            'Last-Modified': stat.mtime.toUTCString()
-        });
-        return res.end();
-    }
-
-    // Set common headers for IPTV compatibility
-    const commonHeaders = {
-        'Content-Type': contentType,
-        'Accept-Ranges': 'bytes',
-        'ETag': etag,
-        'Cache-Control': 'public, max-age=31536000',
-        'Last-Modified': stat.mtime.toUTCString(),
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-        'Access-Control-Allow-Headers': 'Range, If-Range, If-None-Match, If-Modified-Since',
-        'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
-        'X-Content-Type-Options': 'nosniff',
-        'Connection': 'keep-alive'
-    };
-
-    if (range) {
-        const parts = range.replace(/bytes=/, "").split("-");
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-        const chunksize = (end - start) + 1;
-
-        const head = {
-            ...commonHeaders,
-            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-            'Content-Length': chunksize,
-        };
-        res.writeHead(206, head);
-        if (req.method === 'HEAD') {
-            return res.end();
-        }
-        const file = fs.createReadStream(filePath, { start, end });
-        file.pipe(res);
-    } else {
-        const head = {
-            ...commonHeaders,
-            'Content-Length': fileSize,
-        };
-        res.writeHead(200, head);
-        if (req.method === 'HEAD') {
-            return res.end();
-        }
-        fs.createReadStream(filePath).pipe(res);
-    }
-}
-
 // Handle OPTIONS requests for CORS
 app.options('/movie/:username/:password/:stream_id.:ext', (req, res) => {
     res.writeHead(200, {
@@ -730,7 +769,8 @@ app.options('/movie/:username/:password/:stream_id.:ext', (req, res) => {
 
 // VOD by Xtream-style path (with extension)
 app.get('/movie/:username/:password/:stream_id.:ext', async (req, res) => {
-    if (req.params.username !== USERNAME || req.params.password !== PASSWORD) {
+    const authUser = await authenticateStreamAccess(req);
+    if (!authUser) {
         return res.status(403).send("Forbidden");
     }
 
@@ -745,6 +785,10 @@ app.get('/movie/:username/:password/:stream_id.:ext', async (req, res) => {
 
     const vod = vodStreams.find(v => v.vod_id === streamId);
     if (!vod) return res.status(404).send("Stream not found");
+
+    if (!isVodCategoryAllowed(authUser, vod.category_id)) {
+        return res.status(403).send("Category not permitted for this client");
+    }
 
     const filePath = path.join(config.VOD_DIR, vod.file);
     if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
@@ -773,7 +817,8 @@ app.options('/movie/:username/:password/:stream_id', (req, res) => {
 
 // VOD by Xtream-style path (without extension)
 app.get('/movie/:username/:password/:stream_id', async (req, res) => {
-    if (req.params.username !== USERNAME || req.params.password !== PASSWORD) {
+    const authUser = await authenticateStreamAccess(req);
+    if (!authUser) {
         return res.status(403).send("Forbidden");
     }
 
@@ -789,38 +834,39 @@ app.get('/movie/:username/:password/:stream_id', async (req, res) => {
     const vod = vodStreams.find(v => v.vod_id === streamId);
     if (!vod) return res.status(404).send("Stream not found");
 
+    if (!isVodCategoryAllowed(authUser, vod.category_id)) {
+        return res.status(403).send("Category not permitted for this client");
+    }
+
     const filePath = path.join(config.VOD_DIR, vod.file);
     if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
 
     streamFile(req, res, filePath);
 });
 
-
 // SERIES by Xtream-style path (with extension)
 app.get('/series/:username/:password/:stream_id.:ext', async (req, res) => {
-    if (req.params.username !== USERNAME || req.params.password !== PASSWORD) {
+    const authUser = await authenticateStreamAccess(req);
+    if (!authUser) {
         return res.status(403).send("Forbidden");
     }
 
     const streamId = parseInt(req.params.stream_id);
-    console.log(`[series.ext] Request for series_id=${streamId}, ext=${req.params.ext}`);
-    // Legacy behavior: serve the first episode of the series
     try {
+        const series = await SeriesStream.findOne({ series_id: streamId }).lean();
+        if (series && !isSeriesCategoryAllowed(authUser, series.category_id)) {
+            return res.status(403).send("Category not permitted for this client");
+        }
+
         const firstEpisode = await Episode.findOne({ 'series_id': streamId })
             .sort({ season_number: 1, episode_number: 1 })
             .lean();
         if (!firstEpisode) {
-            console.log(`[series.ext] No episodes found for series_id=${streamId}`);
-            const sample = await Episode.find({}).limit(5).lean();
-            console.log(`[series.ext] Sample existing episodes (up to 5):`, sample.map(e => ({ series_id: e.series_id, season_id: e.season_id, episode_id: e.episode_id, file: e.file })));
             return res.status(404).send("No episodes found for this series");
         }
 
         const filePath = path.join(config.SERIES_DIR, firstEpisode.file);
-        console.log(`[series.ext] Found first episode_id=${firstEpisode.episode_id}, file=${firstEpisode.file}`);
-        console.log(`[series.ext] Looking for file at: ${filePath}`);
         if (!fs.existsSync(filePath)) {
-            console.log(`[series.ext] File not found on disk at: ${filePath}`);
             return res.status(404).send("File not found");
         }
 
@@ -832,7 +878,6 @@ app.get('/series/:username/:password/:stream_id.:ext', async (req, res) => {
         };
         const requestedExt = (req.params.ext || '').toLowerCase();
         const contentType = contentTypeByExt[requestedExt] || 'video/mp4';
-        console.log(`[series.ext] Streaming with content-type=${contentType}`);
         streamFile(req, res, filePath, contentType);
     } catch (error) {
         console.error("[series.ext] Error resolving series first episode:", error);
@@ -842,45 +887,30 @@ app.get('/series/:username/:password/:stream_id.:ext', async (req, res) => {
 
 // SERIES by Xtream-style path (without extension)
 app.get('/series/:username/:password/:stream_id', async (req, res) => {
-    console.log(`Streaming request: /series/${req.params.username}/${req.params.password}/${req.params.stream_id}`);
-    
-    if (req.params.username !== USERNAME || req.params.password !== PASSWORD) {
-        console.log("Authentication failed for streaming request");
+    const authUser = await authenticateStreamAccess(req);
+    if (!authUser) {
         return res.status(403).send("Forbidden");
     }
 
     const streamId = parseInt(req.params.stream_id);
-    console.log(`Looking for series with stream_id: ${streamId}`);
-    
-    let seriesStreams = [];
     try {
-        seriesStreams = await SeriesStream.find().lean();
-        console.log(`Found ${seriesStreams.length} series streams in database`);
-    } catch (error) {
-        console.error("Error fetching series streams:", error);
-        return res.status(500).json({ error: "Failed to fetch series streams" });
-    }
+        const series = await SeriesStream.findOne({ series_id: streamId }).lean();
+        if (!series) {
+            return res.status(404).send("Stream not found");
+        }
 
-    const series = seriesStreams.find(v => v.series_id === streamId);
-    if (!series) {
-        console.log(`Series not found for stream_id: ${streamId}`);
-        console.log("Available series IDs:", seriesStreams.map(s => s.series_id));
-        return res.status(404).send("Stream not found");
-    }
+        if (!isSeriesCategoryAllowed(authUser, series.category_id)) {
+            return res.status(403).send("Category not permitted for this client");
+        }
 
-    // Legacy: serve first episode of this series if exists
-    try {
         const firstEpisode = await Episode.findOne({ series_id: streamId })
             .sort({ season_number: 1, episode_number: 1 })
             .lean();
         if (!firstEpisode) {
-            console.log(`No episodes found for series_id: ${streamId}`);
             return res.status(404).send("No episodes found for this series");
         }
         const filePath = path.join(config.SERIES_DIR, firstEpisode.file);
-        console.log(`Streaming first episode file at: ${filePath}`);
         if (!fs.existsSync(filePath)) {
-            console.log(`File not found at: ${filePath}`);
             return res.status(404).send("File not found");
         }
         streamFile(req, res, filePath);
@@ -892,100 +922,72 @@ app.get('/series/:username/:password/:stream_id', async (req, res) => {
 
 // EPISODE by Xtream-style path (with extension)
 app.get('/episode/:username/:password/:episode_id.:ext', async (req, res) => {
-    if (req.params.username !== USERNAME || req.params.password !== PASSWORD) {
+    const authUser = await authenticateStreamAccess(req);
+    if (!authUser) {
         return res.status(403).send("Forbidden");
     }
 
     const episodeId = parseInt(req.params.episode_id);
-    console.log(`[episode.ext] Request for episode_id=${episodeId}, ext=${req.params.ext}`);
-    
-    let episodes = [];
     try {
-        episodes = await Episode.find().lean();
-        console.log(`[episode.ext] Found ${episodes.length} episodes in database`);
+        const episode = await Episode.findOne({ episode_id: episodeId }).lean();
+        if (!episode) {
+            return res.status(404).send("Episode not found");
+        }
+
+        const series = await SeriesStream.findOne({ series_id: episode.series_id }).lean();
+        if (series && !isSeriesCategoryAllowed(authUser, series.category_id)) {
+            return res.status(403).send("Category not permitted for this client");
+        }
+
+        const filePath = path.join(config.SERIES_DIR, episode.file);
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).send("File not found");
+        }
+
+        const contentTypeByExt = {
+            mp4: 'video/mp4',
+            m3u8: 'application/vnd.apple.mpegURL',
+            ts: 'video/mp2t',
+            mkv: 'video/x-matroska',
+        };
+        const requestedExt = (req.params.ext || '').toLowerCase();
+        const contentType = contentTypeByExt[requestedExt] || 'video/mp4';
+        streamFile(req, res, filePath, contentType);
     } catch (error) {
-        console.error("Error fetching episodes:", error);
-        return res.status(500).json({ error: "Failed to fetch episodes" });
+        console.error("[episode.ext] Error resolving episode:", error);
+        return res.status(500).json({ error: "Failed to fetch episode" });
     }
-
-    const episode = episodes.find(e => e.episode_id === episodeId);
-    if (!episode) {
-        console.log(`[episode.ext] Episode not found for episode_id=${episodeId}`);
-        console.log(`[episode.ext] Available episode IDs:`, episodes.map(e => e.episode_id));
-        return res.status(404).send("Episode not found");
-    }
-
-    console.log(`[episode.ext] Found episode:`, { 
-        episode_id: episode.episode_id, 
-        name: episode.name, 
-        file: episode.file,
-        series_id: episode.series_id,
-        season_id: episode.season_id 
-    });
-
-    const filePath = path.join(config.SERIES_DIR, episode.file);
-    console.log(`[episode.ext] Looking for file at: ${filePath}`);
-    
-    if (!fs.existsSync(filePath)) {
-        console.log(`[episode.ext] File not found on disk at: ${filePath}`);
-        return res.status(404).send("File not found");
-    }
-
-    const contentTypeByExt = {
-        mp4: 'video/mp4',
-        m3u8: 'application/vnd.apple.mpegURL',
-        ts: 'video/mp2t',
-        mkv: 'video/x-matroska',
-    };
-    const requestedExt = (req.params.ext || '').toLowerCase();
-    const contentType = contentTypeByExt[requestedExt] || 'video/mp4';
-    console.log(`[episode.ext] Streaming with content-type=${contentType}`);
-    streamFile(req, res, filePath, contentType);
 });
 
 // EPISODE by Xtream-style path (without extension)
 app.get('/episode/:username/:password/:episode_id', async (req, res) => {
-    if (req.params.username !== USERNAME || req.params.password !== PASSWORD) {
+    const authUser = await authenticateStreamAccess(req);
+    if (!authUser) {
         return res.status(403).send("Forbidden");
     }
 
     const episodeId = parseInt(req.params.episode_id);
-    console.log(`[episode] Request for episode_id=${episodeId}`);
-    
-    let episodes = [];
     try {
-        episodes = await Episode.find().lean();
-        console.log(`[episode] Found ${episodes.length} episodes in database`);
+        const episode = await Episode.findOne({ episode_id: episodeId }).lean();
+        if (!episode) {
+            return res.status(404).send("Episode not found");
+        }
+
+        const series = await SeriesStream.findOne({ series_id: episode.series_id }).lean();
+        if (series && !isSeriesCategoryAllowed(authUser, series.category_id)) {
+            return res.status(403).send("Category not permitted for this client");
+        }
+
+        const filePath = path.join(config.SERIES_DIR, episode.file);
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).send("File not found");
+        }
+
+        streamFile(req, res, filePath);
     } catch (error) {
-        console.error("Error fetching episodes:", error);
-        return res.status(500).json({ error: "Failed to fetch episodes" });
+        console.error("[episode] Error resolving episode:", error);
+        return res.status(500).json({ error: "Failed to fetch episode" });
     }
-
-    const episode = episodes.find(e => e.episode_id === episodeId);
-    if (!episode) {
-        console.log(`[episode] Episode not found for episode_id=${episodeId}`);
-        console.log(`[episode] Available episode IDs:`, episodes.map(e => e.episode_id));
-        return res.status(404).send("Episode not found");
-    }
-
-    console.log(`[episode] Found episode:`, { 
-        episode_id: episode.episode_id, 
-        name: episode.name, 
-        file: episode.file,
-        series_id: episode.series_id,
-        season_id: episode.season_id 
-    });
-
-    const filePath = path.join(config.SERIES_DIR, episode.file);
-    console.log(`[episode] Looking for file at: ${filePath}`);
-    
-    if (!fs.existsSync(filePath)) {
-        console.log(`[episode] File not found on disk at: ${filePath}`);
-        return res.status(404).send("File not found");
-    }
-
-    console.log(`[episode] Streaming file: ${episode.file}`);
-    streamFile(req, res, filePath);
 });
 
 

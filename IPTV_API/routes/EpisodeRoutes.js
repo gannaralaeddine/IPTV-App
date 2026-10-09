@@ -1,6 +1,10 @@
 const { Router } = require('express');
 const adminEpisodeController = require('../controllers/adminEpisodeController');
+const { authenticateToken, requireSuperAdmin } = require('../middleware/authMiddleware');
 const router = Router();
+
+// Only super_admin has access to Episodes management
+router.use(authenticateToken, requireSuperAdmin);
 
 // Episode Routes
 router.get("/episodes", adminEpisodeController.getEpisodes);

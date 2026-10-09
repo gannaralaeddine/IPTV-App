@@ -1,7 +1,11 @@
 const { Router } = require('express');
 const adminSeriesController = require('../controllers/adminSeriesController');
+const { authenticateToken, requireSuperAdmin } = require('../middleware/authMiddleware');
 // Removed series file uploads; files belong to episodes
 const router = Router();
+
+// Only super_admin has access to Series management
+router.use(authenticateToken, requireSuperAdmin);
 
 // No multer required
 
