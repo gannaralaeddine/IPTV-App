@@ -53,8 +53,9 @@ mongoose
 
 app.use(cors({
     origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'OPTIONS', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    methods: ['GET', 'POST', 'PUT', 'OPTIONS', 'DELETE', 'HEAD'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Range', 'If-Range', 'If-None-Match', 'If-Modified-Since', 'X-Requested-With'],
+    exposedHeaders: ['Content-Length', 'Content-Range', 'Accept-Ranges', 'ETag', 'Last-Modified']
 }));
 
 app.use((req, res, next) => {
@@ -281,6 +282,10 @@ async function handlePlayerApi(req, res) {
                 }
             }
 
+            const hostHeader = req.get('host') || '';
+            const hostOnly = hostHeader.split(':')[0];
+            const base = `http://${hostOnly}:${PORT}`;
+
             const streams = await LiveStream.find(filter).lean();
 
             const formatted = streams.map((s, i) => ({
@@ -294,7 +299,7 @@ async function handlePlayerApi(req, res) {
                 category_id: s.category_id,
                 custom_sid: "",
                 tv_archive: 0,
-                direct_source: s.file || "",
+                direct_source: `${base}/live/${authUser.username}/${clientPass}/${s.stream_id}.ts`,
                 tv_archive_duration: 0
             }));
 
@@ -690,80 +695,259 @@ app.get('/debug/episodes', async (req, res) => {
     }
 });
 
-// Serve live streams
-app.get('/live/:username/:password/:stream_id', async (req, res) => {
-    const authUser = await authenticateStreamAccess(req);
-    if (!authUser) {
-        return res.status(403).send("Forbidden");
-    }
+// ==========================================
+// Media Streaming & File Delivery Engine
+// ==========================================
 
-    let liveStreams = [];
+function getStreamContentType(filePath, requestedExt) {
+    const diskExt = (path.extname(filePath) || '').toLowerCase().replace('.', '');
+    const mimeMap = {
+        mp4: 'video/mp4',
+        m4v: 'video/mp4',
+        ts: 'video/mp2t',
+        m3u8: 'application/vnd.apple.mpegURL',
+        mkv: 'video/x-matroska',
+        avi: 'video/x-msvideo',
+        mov: 'video/quicktime',
+        webm: 'video/webm',
+        flv: 'video/x-flv',
+        wmv: 'video/x-ms-wmv',
+        mp3: 'audio/mpeg',
+        aac: 'audio/aac'
+    };
+    if (diskExt && mimeMap[diskExt]) {
+        return mimeMap[diskExt];
+    }
+    const cleanReqExt = (requestedExt || '').toLowerCase().replace('.', '');
+    if (cleanReqExt && mimeMap[cleanReqExt]) {
+        return mimeMap[cleanReqExt];
+    }
+    return 'video/mp4';
+}
+
+function streamFile(req, res, filePath, overrideContentTypeOrExt) {
     try {
-        liveStreams = await LiveStream.find().lean();
-    } catch (error) {
-        console.error("Error fetching live streams:", error);
-        return res.status(500).json({ error: "Failed to fetch live streams" });
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).send("File not found");
+        }
+
+        const stat = fs.statSync(filePath);
+        const fileSize = stat.size;
+        const range = req.headers.range;
+        const contentType = getStreamContentType(filePath, overrideContentTypeOrExt);
+        const etag = `"${stat.mtime.getTime().toString(16)}-${stat.size.toString(16)}"`;
+
+        // Check if client already has the current version (ETag match)
+        if (req.headers['if-none-match'] === etag) {
+            res.writeHead(304, {
+                'ETag': etag,
+                'Cache-Control': 'public, max-age=31536000',
+                'Last-Modified': stat.mtime.toUTCString()
+            });
+            return res.end();
+        }
+
+        const commonHeaders = {
+            'Content-Type': contentType,
+            'Accept-Ranges': 'bytes',
+            'ETag': etag,
+            'Cache-Control': 'public, max-age=31536000',
+            'Last-Modified': stat.mtime.toUTCString(),
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+            'Access-Control-Allow-Headers': 'Range, If-Range, If-None-Match, If-Modified-Since, X-Requested-With, Content-Type, Authorization',
+            'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified',
+            'X-Content-Type-Options': 'nosniff',
+            'Connection': 'keep-alive'
+        };
+
+        if (req.method === 'OPTIONS') {
+            res.writeHead(200, commonHeaders);
+            return res.end();
+        }
+
+        if (range) {
+            const matches = range.match(/bytes=(\d*)-(\d*)/);
+            if (!matches) {
+                res.writeHead(416, {
+                    ...commonHeaders,
+                    'Content-Range': `bytes */${fileSize}`
+                });
+                return res.end();
+            }
+
+            let start = matches[1] ? parseInt(matches[1], 10) : 0;
+            let end = matches[2] ? parseInt(matches[2], 10) : fileSize - 1;
+
+            if (isNaN(start) || start < 0) start = 0;
+            if (isNaN(end) || end >= fileSize) end = fileSize - 1;
+
+            if (start > end || start >= fileSize) {
+                res.writeHead(416, {
+                    ...commonHeaders,
+                    'Content-Range': `bytes */${fileSize}`
+                });
+                return res.end();
+            }
+
+            const chunkSize = (end - start) + 1;
+            const head = {
+                ...commonHeaders,
+                'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+                'Content-Length': chunkSize
+            };
+
+            res.writeHead(206, head);
+
+            if (req.method === 'HEAD') {
+                return res.end();
+            }
+
+            const stream = fs.createReadStream(filePath, { start, end });
+            stream.on('error', (err) => {
+                console.error('File stream error:', err.message);
+                if (!res.headersSent) {
+                    res.status(500).send("Stream error");
+                } else {
+                    res.end();
+                }
+            });
+
+            req.on('close', () => {
+                stream.destroy();
+            });
+
+            stream.pipe(res);
+        } else {
+            const head = {
+                ...commonHeaders,
+                'Content-Length': fileSize
+            };
+
+            res.writeHead(200, head);
+
+            if (req.method === 'HEAD') {
+                return res.end();
+            }
+
+            const stream = fs.createReadStream(filePath);
+            stream.on('error', (err) => {
+                console.error('File stream error:', err.message);
+                if (!res.headersSent) {
+                    res.status(500).send("Stream error");
+                } else {
+                    res.end();
+                }
+            });
+
+            req.on('close', () => {
+                stream.destroy();
+            });
+
+            stream.pipe(res);
+        }
+    } catch (err) {
+        console.error('Error in streamFile:', err);
+        if (!res.headersSent) {
+            res.status(500).send("Internal Server Error");
+        } else {
+            res.end();
+        }
     }
+}
 
-    const streamId = parseInt(req.params.stream_id);
-    const stream = liveStreams.find(s => s.stream_id === streamId);
-    if (!stream) return res.status(404).send("Stream not found");
+// ==========================================
+// LIVE STREAMING ROUTES
+// ==========================================
 
-    if (!isLiveCategoryAllowed(authUser, stream.category_id)) {
-        return res.status(403).send("Category not permitted for this client");
-    }
+const streamCorsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+    'Access-Control-Allow-Headers': 'Range, If-Range, If-None-Match, If-Modified-Since, Content-Type, Authorization, X-Requested-With',
+    'Access-Control-Max-Age': '86400'
+};
 
-    const filePath = path.join(config.LIVE_DIR, stream.file);
-    if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
-
-    streamFile(req, res, filePath);
+app.options('/live/:username/:password/:stream_id.:ext', (req, res) => {
+    res.writeHead(200, streamCorsHeaders);
+    res.end();
 });
 
-// Some players require an explicit container extension in the URL
+app.options('/live/:username/:password/:stream_id', (req, res) => {
+    res.writeHead(200, streamCorsHeaders);
+    res.end();
+});
+
+// Serve live stream with explicit container extension
 app.get('/live/:username/:password/:stream_id.:ext', async (req, res) => {
     const authUser = await authenticateStreamAccess(req);
     if (!authUser) {
         return res.status(403).send("Forbidden");
     }
 
-    let liveStreams = [];
+    const streamId = parseInt(req.params.stream_id, 10);
+    if (isNaN(streamId)) {
+        return res.status(400).send("Invalid stream id");
+    }
+
     try {
-        liveStreams = await LiveStream.find().lean();
+        const stream = await LiveStream.findOne({ stream_id: streamId }).lean();
+        if (!stream) return res.status(404).send("Stream not found");
+
+        if (!isLiveCategoryAllowed(authUser, stream.category_id)) {
+            return res.status(403).send("Category not permitted for this client");
+        }
+
+        const filePath = path.join(config.LIVE_DIR, stream.file);
+        if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
+
+        streamFile(req, res, filePath, req.params.ext);
     } catch (error) {
-        console.error("Error fetching live streams:", error);
-        return res.status(500).json({ error: "Failed to fetch live streams" });
+        console.error("Error serving live stream:", error);
+        return res.status(500).json({ error: "Failed to serve live stream" });
     }
-
-    const streamId = parseInt(req.params.stream_id);
-    const stream = liveStreams.find(s => s.stream_id === streamId);
-    if (!stream) return res.status(404).send("Stream not found");
-
-    if (!isLiveCategoryAllowed(authUser, stream.category_id)) {
-        return res.status(403).send("Category not permitted for this client");
-    }
-
-    const filePath = path.join(config.LIVE_DIR, stream.file);
-    if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
-
-    const contentTypeByExt = {
-        mp4: 'video/mp4',
-        m3u8: 'application/vnd.apple.mpegURL',
-        ts: 'video/mp2t',
-        mkv: 'video/x-matroska'
-    };
-    const requestedExt = (req.params.ext || '').toLowerCase();
-    const contentType = contentTypeByExt[requestedExt] || 'video/mp4';
-    streamFile(req, res, filePath, contentType);
 });
 
-// Handle OPTIONS requests for CORS
+// Serve live stream without explicit extension
+app.get('/live/:username/:password/:stream_id', async (req, res) => {
+    const authUser = await authenticateStreamAccess(req);
+    if (!authUser) {
+        return res.status(403).send("Forbidden");
+    }
+
+    const streamId = parseInt(req.params.stream_id, 10);
+    if (isNaN(streamId)) {
+        return res.status(400).send("Invalid stream id");
+    }
+
+    try {
+        const stream = await LiveStream.findOne({ stream_id: streamId }).lean();
+        if (!stream) return res.status(404).send("Stream not found");
+
+        if (!isLiveCategoryAllowed(authUser, stream.category_id)) {
+            return res.status(403).send("Category not permitted for this client");
+        }
+
+        const filePath = path.join(config.LIVE_DIR, stream.file);
+        if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
+
+        streamFile(req, res, filePath);
+    } catch (error) {
+        console.error("Error serving live stream:", error);
+        return res.status(500).json({ error: "Failed to serve live stream" });
+    }
+});
+
+// ==========================================
+// VOD (MOVIE) STREAMING ROUTES
+// ==========================================
+
 app.options('/movie/:username/:password/:stream_id.:ext', (req, res) => {
-    res.writeHead(200, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-        'Access-Control-Allow-Headers': 'Range, If-Range, If-None-Match, If-Modified-Since',
-        'Access-Control-Max-Age': '86400'
-    });
+    res.writeHead(200, streamCorsHeaders);
+    res.end();
+});
+
+app.options('/movie/:username/:password/:stream_id', (req, res) => {
+    res.writeHead(200, streamCorsHeaders);
     res.end();
 });
 
@@ -774,45 +958,27 @@ app.get('/movie/:username/:password/:stream_id.:ext', async (req, res) => {
         return res.status(403).send("Forbidden");
     }
 
-    const streamId = parseInt(req.params.stream_id);
-    let vodStreams = [];
+    const streamId = parseInt(req.params.stream_id, 10);
+    if (isNaN(streamId)) {
+        return res.status(400).send("Invalid stream id");
+    }
+
     try {
-        vodStreams = await VodStream.find().lean();
+        const vod = await VodStream.findOne({ vod_id: streamId }).lean();
+        if (!vod) return res.status(404).send("Stream not found");
+
+        if (!isVodCategoryAllowed(authUser, vod.category_id)) {
+            return res.status(403).send("Category not permitted for this client");
+        }
+
+        const filePath = path.join(config.VOD_DIR, vod.file);
+        if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
+
+        streamFile(req, res, filePath, req.params.ext);
     } catch (error) {
-        console.error("Error fetching vod streams:", error);
-        return res.status(500).json({ error: "Failed to fetch vod streams" });
+        console.error("Error serving movie:", error);
+        return res.status(500).json({ error: "Failed to fetch vod stream" });
     }
-
-    const vod = vodStreams.find(v => v.vod_id === streamId);
-    if (!vod) return res.status(404).send("Stream not found");
-
-    if (!isVodCategoryAllowed(authUser, vod.category_id)) {
-        return res.status(403).send("Category not permitted for this client");
-    }
-
-    const filePath = path.join(config.VOD_DIR, vod.file);
-    if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
-
-    const contentTypeByExt = {
-        mp4: 'video/mp4',
-        m3u8: 'application/vnd.apple.mpegURL',
-        ts: 'video/mp2t',
-        mkv: 'video/x-matroska',
-    };
-    const requestedExt = (req.params.ext || '').toLowerCase();
-    const contentType = contentTypeByExt[requestedExt] || 'video/mp4';
-    streamFile(req, res, filePath, contentType);
-});
-
-// Handle OPTIONS requests for CORS (without extension)
-app.options('/movie/:username/:password/:stream_id', (req, res) => {
-    res.writeHead(200, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-        'Access-Control-Allow-Headers': 'Range, If-Range, If-None-Match, If-Modified-Since',
-        'Access-Control-Max-Age': '86400'
-    });
-    res.end();
 });
 
 // VOD by Xtream-style path (without extension)
@@ -822,27 +988,95 @@ app.get('/movie/:username/:password/:stream_id', async (req, res) => {
         return res.status(403).send("Forbidden");
     }
 
-    const streamId = parseInt(req.params.stream_id);
-    let vodStreams = [];
-    try {
-        vodStreams = await VodStream.find().lean();
-    } catch (error) {
-        console.error("Error fetching vod streams:", error);
-        return res.status(500).json({ error: "Failed to fetch vod streams" });
+    const streamId = parseInt(req.params.stream_id, 10);
+    if (isNaN(streamId)) {
+        return res.status(400).send("Invalid stream id");
     }
 
-    const vod = vodStreams.find(v => v.vod_id === streamId);
-    if (!vod) return res.status(404).send("Stream not found");
+    try {
+        const vod = await VodStream.findOne({ vod_id: streamId }).lean();
+        if (!vod) return res.status(404).send("Stream not found");
 
-    if (!isVodCategoryAllowed(authUser, vod.category_id)) {
+        if (!isVodCategoryAllowed(authUser, vod.category_id)) {
+            return res.status(403).send("Category not permitted for this client");
+        }
+
+        const filePath = path.join(config.VOD_DIR, vod.file);
+        if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
+
+        streamFile(req, res, filePath);
+    } catch (error) {
+        console.error("Error serving movie:", error);
+        return res.status(500).json({ error: "Failed to fetch vod stream" });
+    }
+});
+
+// ==========================================
+// SERIES & EPISODE STREAMING ROUTES
+// ==========================================
+
+app.options('/series/:username/:password/:stream_id.:ext', (req, res) => {
+    res.writeHead(200, streamCorsHeaders);
+    res.end();
+});
+
+app.options('/series/:username/:password/:stream_id', (req, res) => {
+    res.writeHead(200, streamCorsHeaders);
+    res.end();
+});
+
+app.options('/episode/:username/:password/:episode_id.:ext', (req, res) => {
+    res.writeHead(200, streamCorsHeaders);
+    res.end();
+});
+
+app.options('/episode/:username/:password/:episode_id', (req, res) => {
+    res.writeHead(200, streamCorsHeaders);
+    res.end();
+});
+
+// Helper to resolve and stream series episode
+async function handleSeriesOrEpisodeStream(req, res, authUser, streamId, ext) {
+    // 1. Check if streamId is an episode_id (standard Xtream Codes playback for series episodes)
+    const episode = await Episode.findOne({ episode_id: streamId }).lean();
+    if (episode) {
+        const series = await SeriesStream.findOne({ series_id: episode.series_id }).lean();
+        if (series && !isSeriesCategoryAllowed(authUser, series.category_id)) {
+            return res.status(403).send("Category not permitted for this client");
+        }
+
+        const filePath = path.join(config.SERIES_DIR, episode.file);
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).send("File not found");
+        }
+
+        return streamFile(req, res, filePath, ext);
+    }
+
+    // 2. Otherwise check if streamId is a series_id (fallback to first episode)
+    const series = await SeriesStream.findOne({ series_id: streamId }).lean();
+    if (!series) {
+        return res.status(404).send("Stream not found");
+    }
+
+    if (!isSeriesCategoryAllowed(authUser, series.category_id)) {
         return res.status(403).send("Category not permitted for this client");
     }
 
-    const filePath = path.join(config.VOD_DIR, vod.file);
-    if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
+    const firstEpisode = await Episode.findOne({ series_id: streamId })
+        .sort({ season_number: 1, episode_number: 1 })
+        .lean();
+    if (!firstEpisode) {
+        return res.status(404).send("No episodes found for this series");
+    }
 
-    streamFile(req, res, filePath);
-});
+    const filePath = path.join(config.SERIES_DIR, firstEpisode.file);
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).send("File not found");
+    }
+
+    return streamFile(req, res, filePath, ext);
+}
 
 // SERIES by Xtream-style path (with extension)
 app.get('/series/:username/:password/:stream_id.:ext', async (req, res) => {
@@ -851,36 +1085,15 @@ app.get('/series/:username/:password/:stream_id.:ext', async (req, res) => {
         return res.status(403).send("Forbidden");
     }
 
-    const streamId = parseInt(req.params.stream_id);
+    const streamId = parseInt(req.params.stream_id, 10);
+    if (isNaN(streamId)) {
+        return res.status(400).send("Invalid stream id");
+    }
+
     try {
-        const series = await SeriesStream.findOne({ series_id: streamId }).lean();
-        if (series && !isSeriesCategoryAllowed(authUser, series.category_id)) {
-            return res.status(403).send("Category not permitted for this client");
-        }
-
-        const firstEpisode = await Episode.findOne({ 'series_id': streamId })
-            .sort({ season_number: 1, episode_number: 1 })
-            .lean();
-        if (!firstEpisode) {
-            return res.status(404).send("No episodes found for this series");
-        }
-
-        const filePath = path.join(config.SERIES_DIR, firstEpisode.file);
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).send("File not found");
-        }
-
-        const contentTypeByExt = {
-            mp4: 'video/mp4',
-            m3u8: 'application/vnd.apple.mpegURL',
-            ts: 'video/mp2t',
-            mkv: 'video/x-matroska',
-        };
-        const requestedExt = (req.params.ext || '').toLowerCase();
-        const contentType = contentTypeByExt[requestedExt] || 'video/mp4';
-        streamFile(req, res, filePath, contentType);
+        await handleSeriesOrEpisodeStream(req, res, authUser, streamId, req.params.ext);
     } catch (error) {
-        console.error("[series.ext] Error resolving series first episode:", error);
+        console.error("[series.ext] Error resolving series episode:", error);
         return res.status(500).json({ error: "Failed to fetch series" });
     }
 });
@@ -892,31 +1105,16 @@ app.get('/series/:username/:password/:stream_id', async (req, res) => {
         return res.status(403).send("Forbidden");
     }
 
-    const streamId = parseInt(req.params.stream_id);
+    const streamId = parseInt(req.params.stream_id, 10);
+    if (isNaN(streamId)) {
+        return res.status(400).send("Invalid stream id");
+    }
+
     try {
-        const series = await SeriesStream.findOne({ series_id: streamId }).lean();
-        if (!series) {
-            return res.status(404).send("Stream not found");
-        }
-
-        if (!isSeriesCategoryAllowed(authUser, series.category_id)) {
-            return res.status(403).send("Category not permitted for this client");
-        }
-
-        const firstEpisode = await Episode.findOne({ series_id: streamId })
-            .sort({ season_number: 1, episode_number: 1 })
-            .lean();
-        if (!firstEpisode) {
-            return res.status(404).send("No episodes found for this series");
-        }
-        const filePath = path.join(config.SERIES_DIR, firstEpisode.file);
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).send("File not found");
-        }
-        streamFile(req, res, filePath);
-    } catch (e) {
-        console.error("Error resolving first episode:", e);
-        return res.status(500).send("Server error");
+        await handleSeriesOrEpisodeStream(req, res, authUser, streamId, null);
+    } catch (error) {
+        console.error("[series] Error resolving series episode:", error);
+        return res.status(500).json({ error: "Failed to fetch series" });
     }
 });
 
@@ -927,32 +1125,13 @@ app.get('/episode/:username/:password/:episode_id.:ext', async (req, res) => {
         return res.status(403).send("Forbidden");
     }
 
-    const episodeId = parseInt(req.params.episode_id);
+    const episodeId = parseInt(req.params.episode_id, 10);
+    if (isNaN(episodeId)) {
+        return res.status(400).send("Invalid episode id");
+    }
+
     try {
-        const episode = await Episode.findOne({ episode_id: episodeId }).lean();
-        if (!episode) {
-            return res.status(404).send("Episode not found");
-        }
-
-        const series = await SeriesStream.findOne({ series_id: episode.series_id }).lean();
-        if (series && !isSeriesCategoryAllowed(authUser, series.category_id)) {
-            return res.status(403).send("Category not permitted for this client");
-        }
-
-        const filePath = path.join(config.SERIES_DIR, episode.file);
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).send("File not found");
-        }
-
-        const contentTypeByExt = {
-            mp4: 'video/mp4',
-            m3u8: 'application/vnd.apple.mpegURL',
-            ts: 'video/mp2t',
-            mkv: 'video/x-matroska',
-        };
-        const requestedExt = (req.params.ext || '').toLowerCase();
-        const contentType = contentTypeByExt[requestedExt] || 'video/mp4';
-        streamFile(req, res, filePath, contentType);
+        await handleSeriesOrEpisodeStream(req, res, authUser, episodeId, req.params.ext);
     } catch (error) {
         console.error("[episode.ext] Error resolving episode:", error);
         return res.status(500).json({ error: "Failed to fetch episode" });
@@ -966,24 +1145,13 @@ app.get('/episode/:username/:password/:episode_id', async (req, res) => {
         return res.status(403).send("Forbidden");
     }
 
-    const episodeId = parseInt(req.params.episode_id);
+    const episodeId = parseInt(req.params.episode_id, 10);
+    if (isNaN(episodeId)) {
+        return res.status(400).send("Invalid episode id");
+    }
+
     try {
-        const episode = await Episode.findOne({ episode_id: episodeId }).lean();
-        if (!episode) {
-            return res.status(404).send("Episode not found");
-        }
-
-        const series = await SeriesStream.findOne({ series_id: episode.series_id }).lean();
-        if (series && !isSeriesCategoryAllowed(authUser, series.category_id)) {
-            return res.status(403).send("Category not permitted for this client");
-        }
-
-        const filePath = path.join(config.SERIES_DIR, episode.file);
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).send("File not found");
-        }
-
-        streamFile(req, res, filePath);
+        await handleSeriesOrEpisodeStream(req, res, authUser, episodeId, null);
     } catch (error) {
         console.error("[episode] Error resolving episode:", error);
         return res.status(500).json({ error: "Failed to fetch episode" });
